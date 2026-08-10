@@ -1,0 +1,28 @@
+# ActiveEvo runtime requirements for the Stage 1 / Stage 2 / Stage 3 pipeline
+#
+# Recommended system baseline:
+# - OS: Linux
+# - GPU: CUDA-capable GPU sized for the selected local model
+# - CUDA: use a release compatible with the installed vLLM build
+# - Python: 3.12 recommended
+#
+# Notes:
+# - Python 3.13 is not recommended here. `vllm` and `faiss` are usually more stable on Python 3.10-3.12.
+# - vLLM is required only when serving a local model from this environment.
+# - Install with:
+#     pip install -r requirements.txt
+
+# Core I/O and async API calls
+aiohttp>=3.9,<4
+requests>=2.31,<3
+tqdm>=4.65,<5
+
+# Numeric / retrieval
+numpy>=1.26,<2
+faiss-cpu>=1.8,<2
+
+# Embedding stack
+sentence-transformers>=2.7,<6
+
+# Local model serving
+vllm>=0.8,<0.9

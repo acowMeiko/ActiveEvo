@@ -1,0 +1,23 @@
+# Copy this file to deploy.conf and replace the model paths.
+
+PYTHON_BIN=/path/to/python
+HOST=0.0.0.0
+
+# One vLLM instance is launched per GPU. Port = base port + GPU ID.
+DEPLOY_MODEL=llama
+DEPLOY_GPU_IDS="0 1 2 3"
+DEPLOY_PORT_BASE=8100
+DEPLOY_SERVER_SEED=42
+DEPLOY_READY_TIMEOUT=600
+
+LLAMA_PATH=/path/to/Meta-Llama-3.1-8B-Instruct
+QWEN_PATH=/path/to/Qwen2.5-14B-Instruct
+
+TENSOR_PARALLEL_SIZE=1
+GPU_MEMORY_UTILIZATION=0.92
+MAX_MODEL_LEN=32768
+MAX_NUM_SEQS=128
+DTYPE=bfloat16
+VLLM_EXTRA_ARGS="--enforce-eager --enable-prefix-caching --trust-remote-code"
+LOG_DIR=logs
+

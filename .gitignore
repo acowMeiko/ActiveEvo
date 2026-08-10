@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+*~
+
+# Secrets and machine-local configuration
+.env
+*.env
+!*.env.example
+config.env
+deploy.conf
+api_call/logs/
+*.pid
+
+# Datasets and generated learning artifacts
+data/*
+!data/README.md
+!data/examples/
+!data/examples/**
+learning_packet/
+checkpoints/
+
+# Generated Memory stores and vector indices
+memory/
+*.faiss
+*.index
+*.npy
+*.npz
+
+# Experiment outputs and runtime traces
+output/
+outputs/
+results/
+logs/
+archive/
+error_analysis/
+experiments/**/runs/
+experiments/**/results*/
+ablation/**/output/
+ablation/**/logs/
+*.log
+*.jsonl
+
+# Model weights and caches
+.cache/
+hf_cache/
+*.bin
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# Paper and review materials are intentionally kept outside this code release
+paper/
+
