@@ -18,8 +18,8 @@ import numpy as np
 from tqdm.asyncio import tqdm as async_tqdm
 
 from core.field_names import CORE_FIELD, CONDITION_FIELD, TARGET_FIELD, get_field, semantic_fields_complete
-from retrieve_principles import SemanticFeatureEncoder
-from output_paths import (
+from modules.retrieval import SemanticFeatureEncoder
+from utils.output_paths import (
     stage2_dsd_condition_index_file,
     stage2_dsd_core_index_file,
     stage2_dsd_registry_dir,

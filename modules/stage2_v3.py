@@ -24,7 +24,7 @@ from modules.stage2_validation import (
     stable_dev_holdout_split,
     summarize_pairs,
 )
-from output_paths import stage1_learning_packets_file, stage1_level_packets_file, stage_output_dir
+from utils.output_paths import stage1_learning_packets_file, stage1_level_packets_file, stage_output_dir
 from template.prompt_template import (
     SELF_CPE_PROMPT,
     STAGE2_NEIGHBOR_GATE_PROMPT,

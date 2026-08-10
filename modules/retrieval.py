@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 
 from core.config import Config
-from embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
+from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
 from utils.io_utils import load_json
 
 logger = logging.getLogger(__name__)

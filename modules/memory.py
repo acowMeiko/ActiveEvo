@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
+from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
 
 logger = logging.getLogger(__name__)
 

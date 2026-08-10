@@ -17,11 +17,12 @@ from tqdm import tqdm
 from difflib import SequenceMatcher
 from typing import List, Dict, Optional, Tuple
 
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.config import Config
 from utils.io_utils import load_json
-from output_paths import stage1_mining_file, stage1_sampling_file
+from utils.output_paths import stage1_mining_file, stage1_sampling_file
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

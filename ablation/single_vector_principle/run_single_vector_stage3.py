@@ -18,7 +18,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from core.api_call import async_llm_call
 from core.config import Config
-from embedding_utils import DEFAULT_EMBEDDING_MODEL, load_sentence_transformer_with_fallback
+from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, load_sentence_transformer_with_fallback
 from evaluate_principle_guided_test import (
     check_answer_match_with_item,
     parse_level,

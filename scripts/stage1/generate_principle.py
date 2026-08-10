@@ -17,11 +17,12 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from tqdm.asyncio import tqdm as async_tqdm
 
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.api_call import async_llm_call
 from core.config import Config
-from output_paths import stage1_diff_failed_file, stage1_principle_file, stage1_mining_file
+from utils.output_paths import stage1_diff_failed_file, stage1_principle_file, stage1_mining_file
 from template.prompt_template import (
     DIFF_PROMPT,
     GUIDED_ANSWER_PROMPT,

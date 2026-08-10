@@ -1,12 +1,20 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT_DIR"
 
-source "$ROOT_DIR/config.env"
+DRY_RUN="${DRY_RUN:-0}"
+CONFIG_FILE="$ROOT_DIR/config.env"
+DEPLOY_CONFIG="$ROOT_DIR/deploy.conf"
+if [[ "$DRY_RUN" == "1" ]]; then
+  [[ -f "$CONFIG_FILE" ]] || CONFIG_FILE="$ROOT_DIR/config.env.example"
+  [[ -f "$DEPLOY_CONFIG" ]] || DEPLOY_CONFIG="$ROOT_DIR/deploy.conf.example"
+fi
+
+source "$CONFIG_FILE"
 source "$ROOT_DIR/api_call/runtime_config.sh"
-load_deployment_runtime "$ROOT_DIR/deploy.conf"
+load_deployment_runtime "$DEPLOY_CONFIG"
 
 ACTIVE_RUNTIME="$ROOT_DIR/api_call/${LOG_DIR:-logs}/active_deployment.env"
 if [[ -f "$ACTIVE_RUNTIME" ]]; then
@@ -23,15 +31,13 @@ export MEMUA_EMBEDDING_MODEL_PATH="$EMBEDDING_MODEL_PATH"
 export MEMUA_EMBEDDING_DEVICE="$EMBEDDING_DEVICE"
 export MEMUA_HF_CACHE_DIR="${MEMUA_HF_CACHE_DIR:-}"
 
-DRY_RUN="${DRY_RUN:-0}"
-
 if [[ "$DRY_RUN" != "1" ]]; then
   mkdir -p "$LOG_DIR/stage3" output/stage3/tests
 fi
 
 if [[ "$DRY_RUN" != "1" && ! -f "$MEMORY_DIR/principles/principles.json" ]]; then
   echo "[ERROR] Missing memory DB: $ROOT_DIR/$MEMORY_DIR/principles/principles.json" >&2
-  echo "[ERROR] Run bash run_stage2_all_levels.sh first." >&2
+  echo "[ERROR] Run bash scripts/stage2/run_all_levels.sh first." >&2
   exit 1
 fi
 
@@ -64,7 +70,7 @@ run_one() {
   echo
   echo "[INFO] Running test set: $name"
   cmd=(
-    "$PYTHON_BIN" -u evaluate_principle_guided_test.py
+    "$PYTHON_BIN" -u scripts/stage3/evaluate_principle_guided_test.py
     --input "$input_path" \
     --output "$out_dir/principle_guided_test_results.json" \
     --summary-output "$out_dir/principle_guided_test_summary.json" \

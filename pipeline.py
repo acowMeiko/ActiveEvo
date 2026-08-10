@@ -55,7 +55,7 @@ from typing import Dict, Any, List, Optional, Sequence
 
 from core.config import Config
 from core.agent_pipeline import AgentPipeline
-from output_paths import stage3_progress_state_file
+from utils.output_paths import stage3_progress_state_file
 from utils.io_utils import load_json, save_json
 
 logger = logging.getLogger(__name__)
@@ -214,7 +214,7 @@ async def run_single_stage(pipeline: AgentPipeline, args, config: Config):
             progress_state_path=stage3_progress_state_file(config.paths.output_dir, test_scope_key),
             test_scope_key=test_scope_key,
         )
-        from output_paths import stage3_guided_results_file, stage3_guided_summary_file
+        from utils.output_paths import stage3_guided_results_file, stage3_guided_summary_file
         out_root = config.paths.output_dir
         save_json(result["results"], str(stage3_guided_results_file(out_root, dataset)))
         save_json(result["summary"], str(stage3_guided_summary_file(out_root, dataset)))

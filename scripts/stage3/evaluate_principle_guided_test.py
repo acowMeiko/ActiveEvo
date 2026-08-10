@@ -10,11 +10,16 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from tqdm.asyncio import tqdm as async_tqdm
 
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
 from core.api_call import async_llm_call
 from core.config import Config, apply_local_api_port
 from core.runtime_metrics import collect_runtime_metrics
-from generate_principle import extract_semantic_features
-from retrieve_principles import OnlinePrincipleRetriever
+from scripts.stage1.generate_principle import extract_semantic_features
+from modules.retrieval import OnlinePrincipleRetriever
 from template.prompt_template import (
     PRINCIPLE_TO_RULES_PROMPT,
     WEAK_BASELINE_TEST_PROMPT,
@@ -23,7 +28,7 @@ from template.prompt_template import (
 )
 from utils.io_utils import load_json, save_json
 from utils.summary_utils import build_stage3_summary
-from output_paths import stage2_memory_file, stage2_vector_dir, stage3_baseline_results_file, stage3_baseline_summary_file, stage3_guided_results_file, stage3_guided_summary_file
+from utils.output_paths import stage2_memory_file, stage2_vector_dir, stage3_baseline_results_file, stage3_baseline_summary_file, stage3_guided_results_file, stage3_guided_summary_file
 from utils.official_dataset_utils import evaluate_general365_prediction, evaluate_svamp_prediction
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')

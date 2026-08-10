@@ -16,7 +16,7 @@ Stage 1 双 Backbone 并行运行器
       llama/ level{1..4}_learning_packets.json
 
 用法:
-  python run_stage1_dual.py --concurrency 64
+  python scripts/stage1/run_stage1_dual.py --concurrency 64
 """
 
 import asyncio
@@ -24,6 +24,9 @@ import logging
 import os
 import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.config import Config
 from core.agent_pipeline import AgentPipeline

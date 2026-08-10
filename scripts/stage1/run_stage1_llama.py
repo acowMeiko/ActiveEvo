@@ -2,11 +2,14 @@
 """
 Stage 1 单 Backbone (Llama) — Qwen 已跑完，只补 Llama 侧。
 用法:
-  python run_stage1_llama.py --sample-concurrency 128 --diff-concurrency 96
-  python run_stage1_llama.py --resume   # 中断后继续
+  python scripts/stage1/run_stage1_llama.py --sample-concurrency 128 --diff-concurrency 96
+  python scripts/stage1/run_stage1_llama.py --resume   # 中断后继续
 """
 import asyncio, logging, os, sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.config import Config
 from core.agent_pipeline import AgentPipeline

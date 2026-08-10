@@ -25,13 +25,13 @@ Learning Pair 格式：
 
 用法示例：
   # 全流程
-  python build_learning_packets.py --dataset dpo_level1 --ports 8000 8001
+  python scripts/stage1/build_learning_packets.py --dataset dpo_level1 --ports 8000 8001
 
   # 跳过采样（复用已有 sampling_results.json）
-  python build_learning_packets.py --dataset dpo_level1 --skip-sampling --ports 8000 8001
+  python scripts/stage1/build_learning_packets.py --dataset dpo_level1 --skip-sampling --ports 8000 8001
 
   # 跳过采样 + 挖掘（复用已有 hard_negative_pairs.json）
-  python build_learning_packets.py --dataset dpo_level1 --skip-sampling --skip-mining --ports 8000 8001
+  python scripts/stage1/build_learning_packets.py --dataset dpo_level1 --skip-sampling --skip-mining --ports 8000 8001
 """
 import sys
 import argparse
@@ -40,19 +40,20 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.config import Config
 from utils.io_utils import load_json, save_json
-from output_paths import (
+from utils.output_paths import (
     stage1_learning_pairs_file,
     stage1_mining_file,
     stage1_sampling_file,
 )
 
 # 复用已有模块中的核心类，不重复实现逻辑
-from sample_unstable_questions import ModelTester, build_urls
-from hard_negative_mining import HardNegativeMiner
+from scripts.stage1.sample_unstable_questions import ModelTester, build_urls
+from scripts.stage1.hard_negative_mining import HardNegativeMiner
 
 logging.basicConfig(
     level=logging.INFO,

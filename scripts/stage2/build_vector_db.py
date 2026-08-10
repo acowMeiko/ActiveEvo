@@ -19,12 +19,13 @@ from typing import Any, Dict, List, Tuple
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).parent))
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
 
 from core.config import Config
-from embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
+from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
 from utils.io_utils import load_json, save_json
-from output_paths import stage1_principle_file, stage1_learning_packets_file, stage2_memory_file, stage2_vector_dir
+from utils.output_paths import stage1_principle_file, stage1_learning_packets_file, stage2_memory_file, stage2_vector_dir
 import logging
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
