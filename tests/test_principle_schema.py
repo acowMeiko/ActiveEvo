@@ -2,7 +2,9 @@ from modules.principle_schema import (
     EXTENDED_PRINCIPLE_FIELDS,
     build_memory_views,
     principle_content_from_item,
+    render_solver_condition_card,
     render_solver_memory,
+    validate_condition_card,
     validate_principle_content,
 )
 from modules.plan_module import _normalize_principle_fields
@@ -78,3 +80,42 @@ def test_stage2_parser_preserves_exact_extended_schema():
     assert parsed["principles"] == [extended]
     _, errors = validate_principle_content(parsed["principles"][0], require_extended=True)
     assert not errors
+
+
+def test_condition_card_schema_and_solver_rendering_hide_routing_metadata():
+    card, errors = validate_condition_card({
+        "status": "use",
+        "when_to_consider": "Consider this when a current equation contains a rational expression.",
+        "evidence_found": [{
+            "requirement": "A denominator restriction is observable.",
+            "problem_fact": "The current problem contains a denominator that cannot be zero.",
+        }],
+        "do_not_use_if": "Ignore it if no denominator can vanish.",
+        "failure_to_avoid": "Avoid introducing extraneous roots after clearing denominators.",
+        "suggested_action": "State the denominator restriction before clearing fractions. Solve the transformed equation. Then test candidate roots against the original denominator.",
+        "verification": "Substitute candidates into the original expression. Reject any value that makes a denominator zero.",
+        "reason": "The required current fact is present.",
+    })
+    assert not errors
+    rendered = render_solver_condition_card(card)
+    assert "Current fact" in rendered
+    assert "retrieval" not in rendered.lower()
+    assert "memory_id" not in rendered
+
+    _, extra_errors = validate_condition_card({**card, "memory_id": "mem_should_not_be_allowed"})
+    assert "unexpected condition card fields: memory_id" in extra_errors
+
+
+def test_condition_card_rejects_missing_current_problem_fact():
+    card, errors = validate_condition_card({
+        "status": "use",
+        "when_to_consider": "Consider it.",
+        "evidence_found": [{"requirement": "Need a recurrence.", "problem_fact": ""}],
+        "do_not_use_if": "Ignore otherwise.",
+        "failure_to_avoid": "Avoid recurrence transfer.",
+        "suggested_action": "Derive the recurrence from the current problem.",
+        "verification": "Check it.",
+        "reason": "Incomplete evidence.",
+    })
+    assert card["status"] == "use"
+    assert "evidence_found[0].problem_fact must be a non-empty string" in errors

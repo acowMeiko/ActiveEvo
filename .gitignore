@@ -21,6 +21,7 @@ venv/
 !*.env.example
 config.env
 deploy.conf
+*.conf
 api_call/logs/
 *.pid
 
@@ -48,10 +49,19 @@ archive/
 error_analysis/
 experiments/**/runs/
 experiments/**/results*/
+experiments/**/analysis/
+experiments/**/full/
+experiments/**/final*/
+experiments/**/paired/
+experiments/**/smoke*/
+experiments/**/*.json
+experiments/**/*.csv
 ablation/**/output/
 ablation/**/logs/
 *.log
 *.jsonl
+*.csv
+*.zip
 
 # Model weights and caches
 .cache/
@@ -65,3 +75,5 @@ hf_cache/
 # Paper and review materials are intentionally kept outside this code release
 paper/
 
+# Machine-local transfer helpers
+tools/sync/rsync_*.sh

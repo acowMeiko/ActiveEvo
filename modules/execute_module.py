@@ -391,7 +391,7 @@ class ExecuteModule:
                 "protocol_version": SOLVER_V1_PROTOCOL, "guided": guided,
                 "seed": self.seed if seed is None else seed, "solver_url": solver_url,
                 "finalizer_url": "", "infrastructure_success": False,
-                "infrastructure_stage": "reasoner", "reasoner": {"output": ""},
+                "infrastructure_stage": "reasoner", "reasoner": {"output": "", "prompt": reasoner_prompt},
                 "finalizer": {"output": ""}, "final_answer": "", "composed_output": "",
             }
         finalizer_prompt = SOLVER_V1_FINALIZER_PROMPT.format(
@@ -432,6 +432,7 @@ class ExecuteModule:
             "reasoner_repetition_penalty": reasoner_repetition_penalty,
             "reasoner_temperature": reasoner_temperature,
             "reasoner": {
+                "prompt": reasoner_prompt,
                 "output": reasoner_output,
                 "max_tokens": reasoner_max_tokens,
                 "repetition_penalty": reasoner_repetition_penalty,
@@ -485,8 +486,8 @@ class ExecuteModule:
 
         Returns: 输出文件路径 (sampling_results.json)，失败返回 None
         """
-        from scripts.stage1.sample_unstable_questions import ModelTester
-        from utils.output_paths import stage1_sampling_file
+        from sample_unstable_questions import ModelTester
+        from output_paths import stage1_sampling_file
 
         tester = ModelTester(self.config, dataset, urls=self.urls)
         tester.model = self.model
@@ -525,8 +526,8 @@ class ExecuteModule:
 
         Returns: 输出文件路径，失败返回 None
         """
-        from scripts.stage1.hard_negative_mining import HardNegativeMiner
-        from utils.output_paths import stage1_sampling_file, stage1_mining_file
+        from hard_negative_mining import HardNegativeMiner
+        from output_paths import stage1_sampling_file, stage1_mining_file
 
         if sampling_path is None:
             sampling_path = stage1_sampling_file(self.config.paths.output_dir, dataset)

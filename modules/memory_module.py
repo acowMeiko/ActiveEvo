@@ -190,7 +190,7 @@ class MemoryModule:
         if not matches:
             memory_id = self.memory.add(item)
             if item.get("status") == "active":
-                self.memory.build_indices()
+                self.memory.index_added_principle(item)
             return {"operation": "add", "memory_id": memory_id, "version_id": item.get("version_id")}
 
         existing = matches[0]["item"]
@@ -221,6 +221,8 @@ class MemoryModule:
                 "reason": "merge_requires_revalidation",
             }
         memory_id = self.memory.add(item)
+        if item.get("status") == "active":
+            self.memory.index_added_principle(item)
         return {
             "operation": "add",
             "memory_id": memory_id,

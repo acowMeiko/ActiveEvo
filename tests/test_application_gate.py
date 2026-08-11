@@ -67,12 +67,16 @@ def test_adapter_runs_only_after_acceptance_and_keeps_audit_text():
     async def fake_call(self, prompt, **kwargs):
         calls.append(prompt)
         return json.dumps({
-            "status": "adapted",
-            "adapted_lesson": "Avoid transferring a source indexing formula.",
-            "adapted_action": "Derive the current row-size rule before indexing its entries.",
-            "adapted_verification": "Check the derived rule against the first displayed rows.",
-            "removed_source_specific_elements": ["fixed width of five"],
-            "changes": ["Replaced the source width with a current-problem derivation."],
+            "status": "use",
+            "when_to_consider": "Consider this when the current problem asks for an indexed row entry.",
+            "evidence_found": [{
+                "requirement": "The row-size rule is observable.",
+                "problem_fact": "The current question states how entries are arranged in rows.",
+            }],
+            "do_not_use_if": "Ignore it if row widths are not governed by a stable current-problem rule.",
+            "failure_to_avoid": "Avoid transferring a source indexing formula before deriving the current row rule.",
+            "suggested_action": "First derive the row-size rule from the current statement. Then compute the offset using that current rule. Treat any source row width as irrelevant unless it is explicitly present here.",
+            "verification": "Check the inferred row boundary against the current problem. Verify the target entry lies inside that row.",
             "reason": "The action now depends only on current evidence.",
         })
 
@@ -86,8 +90,9 @@ def test_adapter_runs_only_after_acceptance_and_keeps_audit_text():
     accepted = asyncio.run(plan.adapt_memory_for_question(
         "Current question", _candidate(), {"accepted": True}
     ))
-    assert accepted["status"] == "adapted"
-    assert accepted["removed_source_specific_elements"] == ["fixed width of five"]
+    assert accepted["status"] == "use"
+    assert accepted["condition_card"]["suggested_action"].startswith("First derive")
+    assert accepted["condition_card"]["evidence_found"][0]["problem_fact"]
     assert accepted["raw_response"]
     assert len(calls) == 1
 

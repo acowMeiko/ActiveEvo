@@ -13,7 +13,7 @@ import numpy as np
 ROOT_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT_DIR))
 
-from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, load_sentence_transformer_with_fallback
+from embedding_utils import DEFAULT_EMBEDDING_MODEL, load_sentence_transformer_with_fallback
 
 
 def load_json(path: Path) -> Any:

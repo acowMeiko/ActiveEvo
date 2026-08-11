@@ -27,7 +27,7 @@ fi
 
 if [[ "$DRY_RUN" != "1" && ! -f "$MEMORY_DIR/principles/principles.json" ]]; then
   echo "[ERROR] Missing memory DB: $ROOT_DIR/$MEMORY_DIR/principles/principles.json" >&2
-  echo "[ERROR] Run bash scripts/stage2/run_all_levels.sh first." >&2
+  echo "[ERROR] Run bash run_stage2_all_levels.sh first." >&2
   exit 1
 fi
 
@@ -39,7 +39,7 @@ if [[ "$DRY_RUN" != "1" ]]; then
 fi
 
 cmd=(
-  "$PYTHON_BIN" -u scripts/stage3/evaluate_principle_guided_test.py
+  "$PYTHON_BIN" -u evaluate_principle_guided_test.py
   --input "$TEST_INPUT"
   --output "$OUT_DIR/principle_guided_test_results.json"
   --summary-output "$OUT_DIR/principle_guided_test_summary.json"

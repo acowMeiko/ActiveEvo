@@ -25,7 +25,7 @@ logger = logging.getLogger("no_learning_zone")
 
 from core.agent_pipeline import AgentPipeline
 from core.config import Config
-from utils.output_paths import (
+from output_paths import (
     stage2_summary_file,
     stage3_guided_results_file,
     stage3_guided_summary_file,
@@ -102,7 +102,7 @@ async def main_async() -> None:
     if not args.skip_stage1:
         # If reusing existing sampling data, copy it to the expected location first
         if args.stage1_sampling_source:
-            from utils.output_paths import stage1_unified_sampling_file
+            from output_paths import stage1_unified_sampling_file
             target_path = stage1_unified_sampling_file(config.paths.output_dir, backbone)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(args.stage1_sampling_source), str(target_path))

@@ -73,9 +73,9 @@ def limit_rows(rows: List[Dict], limit: int) -> List[Dict]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Prepare unified Stage 3 benchmark inputs")
-    parser.add_argument("--gsm8k-src", type=str, required=True)
+    parser.add_argument("--gsm8k-src", type=str, default="/home/czhu/workplace/task/self-exp/dataset/gsm8k/test.jsonl")
     parser.add_argument("--math500-src", type=str, default=str(PROJECT_ROOT / "data/test/math_500_test.jsonl"))
-    parser.add_argument("--bbh-dir", type=str, required=True)
+    parser.add_argument("--bbh-dir", type=str, default="/home/czhu/workplace/task/self-exp/dataset/bbh")
     parser.add_argument("--bbh-tasks", nargs="*", default=None, help="Specific BBH task filenames without .json")
     parser.add_argument("--out-dir", type=str, default=str(PROJECT_ROOT / "data/test/benchmarks"))
     parser.add_argument("--gsm8k-limit", type=int, default=0)

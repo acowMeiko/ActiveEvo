@@ -1,28 +1,45 @@
-# ActiveEvo runtime requirements for the Stage 1 / Stage 2 / Stage 3 pipeline
+# ActiveEvo complete Python requirements
 #
-# Recommended system baseline:
-# - OS: Linux
-# - GPU: CUDA-capable GPU sized for the selected local model
-# - CUDA: use a release compatible with the installed vLLM build
-# - Python: 3.12 recommended
+# Verified baseline:
+# - Linux
+# - Python 3.12
+# - CUDA 12.4-compatible NVIDIA driver
+# - vLLM servers on GPUs; BGE-M3 embeddings on CPU via
+#   MEMUA_EMBEDDING_DEVICE=cpu
 #
-# Notes:
-# - Python 3.13 is not recommended here. `vllm` and `faiss` are usually more stable on Python 3.10-3.12.
-# - vLLM is required only when serving a local model from this environment.
-# - Install with:
-#     pip install -r requirements.txt
+# Create a clean environment before installing. Do not install this file into a
+# running experiment environment because pip may replace CUDA/PyTorch packages.
+#
+#   python -m pip install --upgrade pip
+#   python -m pip install -r requirements.txt
 
-# Core I/O and async API calls
-aiohttp>=3.9,<4
-requests>=2.31,<3
-tqdm>=4.65,<5
+# Core I/O, HTTP, and progress reporting
+aiohttp>=3.12,<4
+requests>=2.32,<3
+tqdm>=4.67,<5
 
-# Numeric / retrieval
+# Numeric, statistics, symbolic answer matching, and FAISS retrieval
 numpy>=1.26,<2
-faiss-cpu>=1.8,<2
+scipy>=1.13,<2
+sympy>=1.14,<1.15
+faiss-cpu>=1.13,<1.14
 
-# Embedding stack
-sentence-transformers>=2.7,<6
+# Model and embedding stack. These versions match the tested hcz environment.
+torch==2.8.0
+transformers>=4.57,<4.58
+sentence-transformers>=5.2,<5.3
+huggingface-hub>=0.36,<0.37
 
-# Local model serving
-vllm>=0.8,<0.9
+# Dataset preparation. Pin fsspec to the compatibility range required by
+# datasets 4.0; a newer globally installed fsspec causes `pip check` failures.
+datasets>=4.0,<4.1
+fsspec[http]>=2023.1,<=2025.3.0
+
+# Local OpenAI-compatible serving and client access
+vllm==0.10.2
+openai>=1.100,<2
+fastapi>=0.115,<0.117
+uvicorn>=0.30,<0.36
+
+# Test runner (the repository also includes dependency-light contract runners)
+pytest>=8,<9

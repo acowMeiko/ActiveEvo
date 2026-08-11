@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and summarize the reproducible 4x25 Stage-2 format pilot."""
+"""Build and summarize reproducible stratified Stage-2 samples."""
 from __future__ import annotations
 
 import argparse
@@ -41,6 +41,14 @@ def command_manifest(args: argparse.Namespace) -> int:
     from modules.dsd_module import canonicalize_stage1_packets, stage1_packet_is_candidate
 
     run_root = Path(args.run_root)
+    level_counts = (
+        dict(zip(LEVELS, args.level_counts))
+        if args.level_counts is not None
+        else {level: args.per_level for level in LEVELS}
+    )
+    if any(count <= 0 for count in level_counts.values()):
+        raise ValueError(f"All per-level sample counts must be positive: {level_counts}")
+
     entries = []
     for level in LEVELS:
         source = ROOT / "output" / "stage1" / "02_learning_packets" / args.model / f"level{level}_learning_packets.json"
@@ -48,21 +56,26 @@ def command_manifest(args: argparse.Namespace) -> int:
         if not isinstance(packets, list):
             raise ValueError(f"Learning packet file is not a list: {source}")
         canonical = canonicalize_stage1_packets(packets)
-        candidates = [
+        candidates = {
             str(packet.get("question_id", "")) for packet in canonical if stage1_packet_is_candidate(packet)
-        ]
+        }
+        candidates.discard("")
         ranked = sorted(
             candidates,
             key=lambda question_id: hashlib.sha256(f"{question_id}:{args.seed}".encode("utf-8")).hexdigest(),
         )
-        selected = ranked[: args.per_level]
-        if len(selected) != args.per_level:
-            raise ValueError(f"Level {level} has only {len(selected)} eligible candidates")
+        expected_count = level_counts[level]
+        selected = ranked[:expected_count]
+        if len(selected) != expected_count:
+            raise ValueError(
+                f"Level {level} needs {expected_count} samples but has only "
+                f"{len(ranked)} eligible unique candidates"
+            )
         selection_path = run_root / "selection" / f"level{level}.json"
         save(selection_path, {
             "level": level,
             "seed": args.seed,
-            "expected_count": args.per_level,
+            "expected_count": expected_count,
             "question_ids": selected,
         })
         entries.append({
@@ -75,9 +88,9 @@ def command_manifest(args: argparse.Namespace) -> int:
             "selection_file": str(selection_path),
         })
     manifest = {
-        "schema": "format-pilot-manifest-v2",
+        "schema": "stratified-stage2-manifest-v3",
         "seed": args.seed,
-        "per_level": args.per_level,
+        "level_counts": {str(level): level_counts[level] for level in LEVELS},
         "total": sum(entry["selected_count"] for entry in entries),
         "levels": entries,
     }
@@ -308,7 +321,10 @@ def main() -> int:
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--run-root", required=True)
     manifest.add_argument("--model", default="llama")
-    manifest.add_argument("--per-level", type=int, default=25)
+    manifest.add_argument("--per-level", type=int, default=25,
+                          help="Uniform sample count for all four levels")
+    manifest.add_argument("--level-counts", type=int, nargs=4, metavar=("L1", "L2", "L3", "L4"),
+                          help="Per-level sample counts; overrides --per-level")
     manifest.add_argument("--seed", type=int, default=42)
     manifest.set_defaults(handler=command_manifest)
     bootstrap = subparsers.add_parser("bootstrap-cache")

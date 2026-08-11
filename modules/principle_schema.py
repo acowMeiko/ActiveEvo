@@ -207,3 +207,96 @@ def render_solver_memory(content: Dict[str, Any], index: int = 1) -> str:
             f"- Verification: {content.get('verification_step', '')}",
         ]
     )
+
+
+CONDITION_CARD_FIELDS = (
+    "when_to_consider",
+    "evidence_found",
+    "do_not_use_if",
+    "failure_to_avoid",
+    "suggested_action",
+    "verification",
+)
+
+
+def validate_condition_card(value: Any) -> Tuple[Dict[str, Any], List[str]]:
+    """Validate the runtime card produced by the Stage-3 adapter."""
+    if not isinstance(value, dict):
+        return {}, ["condition_card must be an object"]
+    errors: List[str] = []
+    normalized: Dict[str, Any] = {}
+    allowed_fields = set(CONDITION_CARD_FIELDS) | {"status", "reason"}
+    extras = sorted(set(value) - allowed_fields)
+    if extras:
+        errors.append("unexpected condition card fields: " + ", ".join(extras))
+    status = str(value.get("status", "")).strip().lower()
+    if status not in {"use", "reject"}:
+        errors.append("status must be use or reject")
+    normalized["status"] = status or "reject"
+    for field in (
+        "when_to_consider",
+        "do_not_use_if",
+        "failure_to_avoid",
+        "suggested_action",
+        "verification",
+        "reason",
+    ):
+        raw = value.get(field, "")
+        if not isinstance(raw, str):
+            errors.append(f"{field} must be a string")
+            normalized[field] = ""
+            continue
+        normalized[field] = " ".join(raw.split()).strip()
+        if status == "use" and field != "reason" and not normalized[field]:
+            errors.append(f"{field} must not be empty when status=use")
+    evidence = value.get("evidence_found", [])
+    normalized_evidence: List[Dict[str, str]] = []
+    if not isinstance(evidence, list):
+        errors.append("evidence_found must be a list")
+    else:
+        for idx, item in enumerate(evidence):
+            if not isinstance(item, dict):
+                errors.append(f"evidence_found[{idx}] must be an object")
+                continue
+            requirement = item.get("requirement")
+            problem_fact = item.get("problem_fact")
+            if not isinstance(requirement, str) or not requirement.strip():
+                errors.append(f"evidence_found[{idx}].requirement must be a non-empty string")
+                requirement = ""
+            if not isinstance(problem_fact, str) or not problem_fact.strip():
+                errors.append(f"evidence_found[{idx}].problem_fact must be a non-empty string")
+                problem_fact = ""
+            if requirement or problem_fact:
+                normalized_evidence.append({
+                    "requirement": " ".join(str(requirement).split()).strip(),
+                    "problem_fact": " ".join(str(problem_fact).split()).strip(),
+                })
+    if status == "use" and not normalized_evidence:
+        errors.append("evidence_found must contain at least one item when status=use")
+    normalized["evidence_found"] = normalized_evidence
+    return normalized, errors
+
+
+def render_solver_condition_card(card: Dict[str, Any], index: int = 1) -> str:
+    """Render the only Stage-3 memory text allowed inside the guided Solver."""
+    evidence_lines = []
+    for item in card.get("evidence_found", []):
+        if not isinstance(item, dict):
+            continue
+        requirement = str(item.get("requirement", "")).strip()
+        problem_fact = str(item.get("problem_fact", "")).strip()
+        if requirement or problem_fact:
+            evidence_lines.append(f"  - Need: {requirement} | Current fact: {problem_fact}")
+    evidence_text = "\n".join(evidence_lines) if evidence_lines else "  - None."
+    return "\n".join(
+        [
+            f"[Conditional Experience Card {index}]",
+            f"When to consider: {card.get('when_to_consider', '')}",
+            "Evidence found:",
+            evidence_text,
+            f"Do not use if: {card.get('do_not_use_if', '')}",
+            f"Failure to avoid: {card.get('failure_to_avoid', '')}",
+            f"Suggested action: {card.get('suggested_action', '')}",
+            f"Verification: {card.get('verification', '')}",
+        ]
+    )

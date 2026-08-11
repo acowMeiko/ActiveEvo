@@ -24,7 +24,7 @@ from modules.stage2_validation import (
     stable_dev_holdout_split,
     summarize_pairs,
 )
-from utils.output_paths import stage1_learning_packets_file, stage1_level_packets_file, stage_output_dir
+from output_paths import stage1_learning_packets_file, stage1_level_packets_file, stage_output_dir
 from template.prompt_template import (
     SELF_CPE_PROMPT,
     STAGE2_NEIGHBOR_GATE_PROMPT,
@@ -893,8 +893,13 @@ async def run_stage2_v3(
                 "question_id": unit.get("question_id", ""),
                 **decision,
             })
-        pipeline.memory.build_indices()
-        pipeline.memory.save_indices()
+        # commit_stage2_candidate keeps append-only additions aligned with the
+        # in-memory FAISS indices. Avoid an unnecessary final full re-encode;
+        # build only when a non-empty Store has no index yet.
+        if pipeline.memory.principle_count > 0 and not pipeline.memory.is_indexed:
+            pipeline.memory.build_indices()
+        if pipeline.memory.is_indexed:
+            pipeline.memory.save_indices()
         pipeline.memory.save()
         pipeline.memory.snapshot(round_id)
     atomic_save_json(artifact_root / "09_store_commit/store_commit.json", decisions)

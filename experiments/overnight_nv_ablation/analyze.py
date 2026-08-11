@@ -62,10 +62,23 @@ def main() -> None:
     report = {"protocol": {"seeds": [42, 43, 44], "temperature": 0.2, "answer_dependent_retry": False},
               "variants": summaries, "paired_comparisons": comparisons}
     (root / "overnight_summary.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    lines = ["# Overnight NV Ablation", "", "| Variant | Active Memory | Pass@1 | Pass@3 | Infra failures | Retrieval used |", "|---|---:|---:|---:|---:|---:|"]
+    lines = [
+        "# Overnight NV Ablation",
+        "",
+        "| Variant | Active Memory | Pass@1 | Pass@3 | Infra failures | Retrieval used | Gate selected | Adapter accepted | Solver use/ignore/missing |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
     for name in variants:
         s = summaries[name]
-        lines.append(f"| {name} | {s['active_memory_count']} | {s['pass1_correct']}/400 ({s['pass1_accuracy']:.3%}) | {s['pass3_correct']}/400 ({s['pass3_accuracy']:.3%}) | {s['infrastructure_failure_count']} | {s['retrieval_used_count']} |")
+        total = int(s.get("total", 400))
+        lines.append(
+            f"| {name} | {s['active_memory_count']} | "
+            f"{s['pass1_correct']}/{total} ({s['pass1_accuracy']:.3%}) | "
+            f"{s['pass3_correct']}/{total} ({s['pass3_accuracy']:.3%}) | "
+            f"{s['infrastructure_failure_count']} | {s['retrieval_used_count']} | "
+            f"{s.get('application_gate_selected_count', 0)} | {s.get('adapter_accept_count', 0)} | "
+            f"{s.get('solver_use_count', 0)}/{s.get('solver_ignore_count', 0)}/{s.get('solver_decision_missing_count', 0)} |"
+        )
     lines.extend(["", "## Paired comparisons", ""])
     for name, blocks in comparisons.items():
         lines.append(f"### {name}")

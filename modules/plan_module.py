@@ -17,7 +17,7 @@ from core.api_call import async_llm_call
 from core.config import Config
 from core.field_names import CORE_FIELD, CONDITION_FIELD, TARGET_FIELD, get_field
 from modules.execute_module import URLRouter, filter_healthy_urls
-from modules.principle_schema import validate_principle_content
+from modules.principle_schema import validate_condition_card, validate_principle_content
 from template.prompt_template import (
     DIFF_PROMPT,
     GUIDED_ANSWER_PROMPT,
@@ -775,7 +775,7 @@ class PlanModule:
             task_objective=get_field(source_dsd, TARGET_FIELD),
             diff_list=diff_json,
         )
-        response = await self._call_llm(prompt, temperature=0.0, max_tokens=1536)
+        response = await self._call_llm(prompt, temperature=0.0, max_tokens=3072)
         parsed, initial_parse_stage = self._extract_stage2_principle_json(response)
         principle = parsed.get("principle", {}) if parsed else {}
         normalized, initial_errors = validate_principle_content(principle, require_extended=True)
@@ -796,7 +796,7 @@ class PlanModule:
                 "\"failure_mode\":\"...\"}}.\n"
                 f"Validation errors: {errors}\nMalformed output:\n{response}"
             )
-            repaired_response = await self._call_llm(repair_prompt, temperature=0.0, max_tokens=1536)
+            repaired_response = await self._call_llm(repair_prompt, temperature=0.0, max_tokens=3072)
             repaired, repair_parse_stage = self._extract_stage2_principle_json(repaired_response)
             normalized, errors = validate_principle_content(
                 repaired.get("principle", {}) if repaired else {}, require_extended=True
@@ -1198,11 +1198,8 @@ class PlanModule:
         if not gate_judgment.get("accepted"):
             return {
                 "status": "reject",
-                "adapted_lesson": "",
-                "adapted_action": "",
-                "adapted_verification": "",
-                "removed_source_specific_elements": [],
-                "changes": [],
+                "condition_card": {},
+                "schema_errors": [],
                 "reason": "structural_gate_rejected",
                 "raw_response": "",
             }
@@ -1213,7 +1210,6 @@ class PlanModule:
             source_item = retrieval.get("item", {}) if isinstance(retrieval.get("item"), dict) else {}
         source_dsd = source_item.get("source_dsd", {}) if isinstance(source_item.get("source_dsd"), dict) else {}
         payload = {
-            "memory_id": candidate.get("memory_id", ""),
             "source_question": source_item.get("question", source_item.get("source_question_text", "")),
             "source_structure": {
                 "core_skill": source_dsd.get("core_skill", source_item.get("core_skill", "")),
@@ -1222,36 +1218,35 @@ class PlanModule:
                 ),
                 "task_objective": source_dsd.get("task_objective", source_item.get("task_objective", "")),
             },
-            "source_lesson": content.get("introspection", ""),
-            "source_action": content.get("action_guidance", ""),
-            "source_verification": content.get("verification_step", ""),
+            "principle": {
+                "introspection": content.get("introspection", ""),
+                "trigger_condition": content.get("trigger_condition", ""),
+                "required_evidence": content.get("required_evidence", []),
+                "exclusion_condition": content.get("exclusion_condition", ""),
+                "failure_mode": content.get("failure_mode", ""),
+                "action_guidance": content.get("action_guidance", ""),
+                "verification_step": content.get("verification_step", ""),
+                "scope": content.get("scope", ""),
+                "generalization_level": content.get("generalization_level", "family"),
+            },
             "gate_judgment": gate_judgment,
         }
         prompt = MEMORY_ACTION_BINDING_PROMPT.format(
             question=question,
             candidate_json=json.dumps(payload, ensure_ascii=False, indent=2),
         )
-        response = await self._call_llm(prompt, temperature=0.0, max_tokens=1536)
+        response = await self._call_llm(prompt, temperature=0.0, max_tokens=2048)
         parsed = self._extract_json(response, task="generic") or {}
-        status = str(parsed.get("status", "reject")).strip().lower()
-        if status not in {"adapted", "unchanged", "reject"}:
+        card, schema_errors = validate_condition_card(parsed)
+        status = card.get("status", "reject")
+        if schema_errors:
             status = "reject"
-        adapted_action = str(parsed.get("adapted_action", "")).strip()
-        if status != "reject" and not adapted_action:
-            status = "reject"
-        removed = parsed.get("removed_source_specific_elements", [])
-        changes = parsed.get("changes", [])
-        if not isinstance(removed, list):
-            removed = [str(removed)] if removed else []
-        if not isinstance(changes, list):
-            changes = [str(changes)] if changes else []
+            card["status"] = "reject"
         return {
             "status": status,
-            "adapted_lesson": str(parsed.get("adapted_lesson", "")).strip() if status != "reject" else "",
-            "adapted_action": adapted_action if status != "reject" else "",
-            "adapted_verification": str(parsed.get("adapted_verification", "")).strip() if status != "reject" else "",
-            "removed_source_specific_elements": [str(value) for value in removed],
-            "changes": [str(value) for value in changes],
+            "condition_card": card if status == "use" else {},
+            "schema_errors": schema_errors,
+            "source_principle": content,
             "reason": str(parsed.get("reason", "parse_failed_or_rejected")).strip(),
             "raw_response": response,
         }

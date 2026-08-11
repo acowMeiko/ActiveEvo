@@ -182,13 +182,46 @@ SOLVER_V1_REASONER_PROMPT = SOLVER_V1_REASONER_PROMPT_TEMPLATE.format(
 )
 
 
-SOLVER_V1_GUIDED_REASONER_PROMPT = SOLVER_V1_REASONER_PROMPT_TEMPLATE.format(
-    experience_context=(
-        "The following experience may be relevant. Apply it only after checking "
-        "its stated conditions against the current problem:\n\n{principle_text}"
-    ),
-    question="{question}",
-)
+SOLVER_V1_GUIDED_REASONER_PROMPT = r'''
+You are a mathematical problem solver.
+
+[Optional Conditional Experience Card]
+{principle_text}
+
+The card is optional procedural advice for the CURRENT problem. It is not a
+claim that the answer is known, not evidence, and not an instruction that must
+be obeyed. Decide whether to use or ignore it from the current problem facts
+alone. If its required facts are missing or its rejection condition applies,
+ignore it and solve independently.
+
+Rules:
+1. First make an Experience Decision: use or ignore, with a short reason grounded only in the current problem.
+2. Then identify the key formula, invariant, transformation, or necessary case split.
+3. Follow one coherent route. Every step must add a new mathematical deduction.
+4. Do not restart the solution or repeat an equivalent statement.
+5. Do not enumerate more than 10 individual cases when a general pattern, recurrence, invariant, or closed form can be derived.
+6. Use exact expressions unless a decimal approximation is requested.
+7. End with one direct verification of the derived result.
+8. Do not state or box a final answer; a separate finalizer will do that.
+9. Do not discuss retrieval, matching, memory IDs, scores, confidence, source problems, or whether an external system marked the card applicable.
+
+Use exactly this format:
+
+Experience Decision:
+use | ignore — [brief reason based on current-problem facts]
+
+Method:
+[one sentence]
+
+Reasoning:
+[a compact derivation]
+
+Check:
+[one direct verification]
+
+Problem:
+{question}
+'''
 
 
 SOLVER_V1_FINALIZER_PROMPT = r'''
@@ -792,10 +825,11 @@ INSTRUCTIONS:
 
 **Step 2: Principle Formulation.** Based on the root cause, formulate ONE defensive principle that would prevent this specific class of error in future problems. The principle must be:
 - TRIGGERED by a recognizable scenario (not "always check")
-- ACTIONABLE with a concrete step (not "be careful")
+- ACTIONABLE with concrete, advisory steps (not "be careful")
 - SCOPED to the right problem class (not too broad, not too narrow)
 - EXPLICIT about evidence that must be observed and conditions that forbid application
 - PARAMETERIZED: source-problem constants or formulas may not be transferred unless they are universal identities
+- INFORMATIVE enough that a downstream solver can understand why the advice matters after routing fields are selectively rewritten for the current problem
 
 CRITICAL RULES:
 1. Do NOT output Step 1/2 as plain text. Use them ONLY as your internal reasoning process.
@@ -807,17 +841,19 @@ CRITICAL RULES:
 7. GENERALIZATION: use `instance` if safe abstraction is impossible, `family` for a structurally defined family, and `universal` only for a mathematical identity that needs no source-specific condition.
 8. FAMILY-LEVEL TRIGGER: Include the minimum structure required to execute the action, but do not repeat source numbers, variable names, story details, or the exact target value.
 9. SEPARATION OF DUTIES: `trigger_condition` supports recall; `required_evidence` lists every mandatory fact; `exclusion_condition` names structural mismatches that force rejection.
-10. JSON OUTPUT ONLY: raw JSON, no markdown blocks, no conversational text.
+10. FIELD LENGTHS: `introspection` should be 1-2 sentences. `required_evidence` must contain 2-5 observable facts. `action_guidance` must contain 3-6 advisory, executable sentences. `verification_step` must contain 2-4 concrete checks. `failure_mode` should explain the mistake the solver is trying to avoid.
+11. ADVISORY TONE: Write the principle as rejectable guidance, not as a mandatory theorem. Prefer "When the current problem shows..., consider..." over commands that assume applicability.
+12. JSON OUTPUT ONLY: raw JSON, no markdown blocks, no conversational text.
 
 JSON SCHEMA:
 {{
   "principle": {{
-    "introspection": "[ONE sentence explaining WHY the model failed at the divergence point — the root cause, not the symptom]",
+    "introspection": "[1-2 sentences explaining WHY the model failed at the divergence point — the root cause, not the symptom]",
     "trigger_condition": "[A concise, recognizable condition that should activate this principle — when should it fire?]",
-    "required_evidence": ["[One observable mandatory fact]", "[Another observable mandatory fact]"],
+    "required_evidence": ["[Observable mandatory fact 1]", "[Observable mandatory fact 2]", "[Optional fact 3]"],
     "exclusion_condition": "[Observable mismatch that forces rejection, including changed recurrences, constraints, objects, or objectives]",
-    "action_guidance": "[A concrete imperative instruction — exactly WHAT step to take, in ONE sentence]",
-    "verification_step": "[A concrete check proving the action remains valid for the current problem]",
+    "action_guidance": "[3-6 advisory executable sentences explaining what to do, why it helps, and how to avoid the failure without using source-specific payload]",
+    "verification_step": "[2-4 concrete checks proving the action remains valid for the current problem]",
     "generalization_level": "instance | family | universal",
     "scope": "[The class of problems this principle applies to — be specific enough to avoid false positives]",
     "failure_mode": "[The specific failure pattern this principle prevents — what would go wrong without it?]"
@@ -976,15 +1012,18 @@ JSON SCHEMA:
 
 
 MEMORY_ACTION_BINDING_PROMPT = '''You are a constrained math-memory adapter.
-A separate structural gate has already accepted this memory for the current problem. Convert its action into a short optional procedure for the CURRENT problem without solving the problem.
+A separate structural gate has already accepted this memory for the current problem. Rewrite the accepted memory into ONE six-field conditional card for the CURRENT problem without solving the problem.
 
 Rules:
-1. Preserve the mathematical intent of the original action.
-2. Remove source-specific numbers, variable names, conclusions, and formulas unless the same value or formula is explicitly derivable from the current problem.
-3. Bind abstract roles to the current problem only when the correspondence is explicit.
+1. Preserve the mathematical intent of the original memory, but write only current-problem-facing guidance.
+2. Remove source questions, source answers, memory IDs, retrieval scores, confidence, source-specific numbers, source variable names, source-only conclusions, and formulas unless the same value or formula is explicitly derivable from the current problem statement.
+3. Bind each required evidence item to an observable current-problem fact. If a requirement cannot be matched to the current problem, return `status="reject"`.
 4. Do not add a new theorem, fact, assumption, intermediate result, or answer.
-5. If safe adaptation is impossible, return `status="reject"` and an empty adapted action.
-6. Output raw JSON only.
+5. Do not solve the problem and do not reveal any final answer.
+6. `suggested_action` should be 3-6 concise advisory sentences. It may explain why the action helps, but it must not assert that the card is reliable or applicable.
+7. `verification` should contain 2-4 concrete checks the solver can perform after using the action.
+8. If safe adaptation is impossible, return `status="reject"` and leave all card fields empty except `reason`.
+9. Output raw JSON only.
 
 [Current Problem]
 {question}
@@ -994,13 +1033,16 @@ Rules:
 
 JSON SCHEMA:
 {{
-  "status": "adapted | unchanged | reject",
-  "adapted_lesson": "short source-free description of the failure to avoid",
-  "adapted_action": "short optional procedure bound to the current problem",
-  "adapted_verification": "one check for whether the procedure was applied validly",
-  "removed_source_specific_elements": ["what was removed or generalized"],
-  "changes": ["concise difference from the source text"],
-  "reason": "why the adaptation preserves or cannot preserve the source intent"
+  "status": "use | reject",
+  "when_to_consider": "current-problem condition under which the solver should consider the card",
+  "evidence_found": [
+    {{"requirement": "required evidence from the memory", "problem_fact": "matching fact observed in the current problem"}}
+  ],
+  "do_not_use_if": "current-problem condition that should make the solver ignore this card",
+  "failure_to_avoid": "short current-problem-facing description of the mistake to avoid",
+  "suggested_action": "3-6 advisory executable sentences, source-free and answer-free",
+  "verification": "2-4 current-problem checks",
+  "reason": "why the card can or cannot be safely rewritten"
 }}
 '''
 

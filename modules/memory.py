@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
+from embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -1058,6 +1058,20 @@ class Memory:
         self._single_embeddings = np.vstack([self._single_embeddings, single_vec])
         if self._faiss_single is not None:
             self._faiss_single.add(single_vec)
+
+    def index_added_principle(self, item: Dict[str, Any]) -> None:
+        """Index one newly added active item without re-encoding the whole Store.
+
+        The first active item initializes all four indices. Later additions are
+        encoded once and appended, keeping the embedding rows aligned with the
+        active-principle order.
+        """
+        if item.get("status") != "active":
+            return
+        if self._core_embeddings is None:
+            self.build_indices()
+        else:
+            self._append_to_indices(item)
 
     def _ensure_index_alignment(self) -> bool:
         """Ensure cached embeddings cover exactly the active principles."""

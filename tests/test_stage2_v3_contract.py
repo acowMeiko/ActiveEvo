@@ -187,6 +187,50 @@ def test_memory_replacement_keeps_version_history(tmp_path):
     assert item["version_history"][0]["status"] == "deprecated"
 
 
+def test_memory_additions_append_indices_without_full_rebuild(tmp_path):
+    class FakeEmbeddingModel:
+        def __init__(self):
+            self.encoded_item_counts = []
+
+        def encode(self, texts, show_progress_bar=False):
+            self.encoded_item_counts.append(len(texts))
+            rows = []
+            for index, text in enumerate(texts):
+                base = float(len(str(text)) + index + 1)
+                rows.append([base, base + 1.0, base + 2.0, base + 3.0])
+            return np.asarray(rows, dtype=np.float32)
+
+    memory = Memory(str(tmp_path))
+    model = FakeEmbeddingModel()
+    memory._embedding_model = model
+
+    first = {
+        "memory_id": "mem1", "status": "active", "principle": "first lesson",
+        "core_skill": "algebra", "context_constraints": "positive domain",
+        "task_objective": "solve equation",
+    }
+    memory.add(first)
+    memory.index_added_principle(first)
+    assert memory._core_embeddings.shape[0] == 1
+    assert memory._faiss_core.ntotal == 1
+    calls_after_first = len(model.encoded_item_counts)
+
+    second = {
+        "memory_id": "mem2", "status": "active", "principle": "second lesson",
+        "core_skill": "geometry", "context_constraints": "nondegenerate triangle",
+        "task_objective": "find an angle",
+    }
+    memory.add(second)
+    memory.index_added_principle(second)
+
+    assert memory._core_embeddings.shape[0] == 2
+    assert memory._single_embeddings.shape[0] == 2
+    assert memory._faiss_core.ntotal == 2
+    assert memory._faiss_single.ntotal == 2
+    # Appending encodes only the new item's three facets plus one solver text.
+    assert model.encoded_item_counts[calls_after_first:] == [3, 1]
+
+
 def test_dsd_validation_neighbors_never_relax_thresholds():
     registry = DSDRegistry.__new__(DSDRegistry)
     registry.records = [

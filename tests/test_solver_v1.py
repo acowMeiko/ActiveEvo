@@ -27,7 +27,16 @@ def test_frozen_solver_v1_limits_and_hashes():
 def test_reasoner_prompts_have_same_contract():
     base = SOLVER_V1_REASONER_PROMPT.format(question="What is 2+2?")
     guided = SOLVER_V1_GUIDED_REASONER_PROMPT.format(
-        question="What is 2+2?", principle_text="Add the terms."
+        question="What is 2+2?",
+        principle_text=(
+            "[Conditional Experience Card 1]\n"
+            "When to consider: Addition is requested.\n"
+            "Evidence found:\n  - Need: An addition expression. | Current fact: The problem asks 2+2.\n"
+            "Do not use if: No arithmetic operation is present.\n"
+            "Failure to avoid: Avoid changing the operation.\n"
+            "Suggested action: Add the terms directly.\n"
+            "Verification: Subtract one addend from the result."
+        ),
     )
     for prompt in (base, guided):
         assert "Method:" in prompt
@@ -35,12 +44,13 @@ def test_reasoner_prompts_have_same_contract():
         assert "Check:" in prompt
         assert "a separate finalizer" in prompt
     assert "retrieval_score" not in guided
-    # Base and Guided differ only in the contents of the optional-experience
-    # section; all solving and output rules come from one shared template.
     assert "No external experience is provided" in base
-    assert "The following experience may be relevant" in guided
+    assert "Experience Decision:" in guided
+    assert "use | ignore" in guided
+    assert "Conditional Experience Card" in guided
     assert "conditional suggestion, not as evidence" in base
-    assert "conditional suggestion, not as evidence" in guided
+    assert "not evidence" in guided
+    assert "memory IDs" in guided
 
 
 def test_finalizer_contract_and_format_check():

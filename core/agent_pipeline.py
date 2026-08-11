@@ -63,7 +63,7 @@ from modules.stage1_sampler import Stage1Sampler
 from modules.stage1_miner import Stage1Miner
 from modules.stage2_repair import RecursiveRepairProtocol
 from modules.dsd_module import DSDRegistry
-from utils.output_paths import (
+from output_paths import (
     stage2_memory_file,
     stage2_summary_file,
     stage1_learning_packets_file,
@@ -2189,7 +2189,7 @@ async def _cli_main():
                 test_scope_key=test_scope_key,
                 backbone=args.backbone,
             )
-            from utils.output_paths import stage3_guided_results_file, stage3_guided_summary_file
+            from output_paths import stage3_guided_results_file, stage3_guided_summary_file
             out_root = config.paths.output_dir
             save_json(result["results"], str(stage3_guided_results_file(out_root, dataset, args.backbone)))
             save_json(result["summary"], str(stage3_guided_summary_file(out_root, dataset, args.backbone)))

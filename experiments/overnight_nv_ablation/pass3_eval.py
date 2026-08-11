@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -23,7 +24,10 @@ from modules.execute_module import ExecuteModule, filter_healthy_urls
 from modules.execute_module import SOLVER_V1_PROMPT_HASHES, SOLVER_V1_PROTOCOL
 from modules.memory_module import MemoryModule
 from modules.plan_module import PlanModule
-from modules.principle_schema import principle_content_from_item, render_solver_memory
+from modules.principle_schema import (
+    principle_content_from_item,
+    render_solver_condition_card,
+)
 from modules.stage2_validation import atomic_save_json
 from template.prompt_template import (
     SOLVER_V1_FINALIZER_PROMPT,
@@ -34,6 +38,15 @@ from utils.io_utils import load_json
 
 logger = logging.getLogger("overnight.pass3")
 SEEDS = (42, 43, 44)
+
+
+def experience_decision(text: str) -> str:
+    match = re.search(
+        r"Experience Decision:\s*(use|ignore)\b",
+        text or "",
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).lower() if match else "missing"
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--candidate-top-k", type=int, default=12)
     parser.add_argument("--gate-top-k", type=int, default=6)
     parser.add_argument("--max-injected", type=int, default=1)
+    parser.add_argument("--limit", type=int, default=0, help="Smoke-test prefix size; official runs leave this unset.")
     return parser.parse_args()
 
 
@@ -73,6 +87,9 @@ async def main() -> None:
     test_data = load_json(args.test_file)
     if not isinstance(test_data, list) or len(test_data) != 400:
         raise ValueError(f"Official DeepScaler input must contain exactly 400 items, got {len(test_data) if isinstance(test_data, list) else 'non-list'}")
+    if args.limit:
+        test_data = test_data[:args.limit]
+    total_items = len(test_data)
 
     urls = filter_healthy_urls([f"http://127.0.0.1:{port}/v1/chat/completions" for port in args.ports])
     if len(urls) != len(args.ports):
@@ -129,7 +146,10 @@ async def main() -> None:
 
     async def retrieve_memory(question: str, idx: int) -> Dict[str, Any]:
         if not guided or plan is None or memory is None or active_memory_count == 0:
-            return {"used": False, "candidate_ids": [], "selected_ids": [], "solver_text": "", "injected_solver_views": []}
+            return {
+                "used": False, "candidate_ids": [], "selected_ids": [],
+                "solver_text": "", "condition_cards": [], "adapter_results": [],
+            }
         with llm_request_context(f"stage3_{idx}", "routing_semantics"):
             semantics = await plan.extract_semantics(question)
         retrieved = memory.retrieve(semantics, top_k=args.candidate_top_k, threshold=args.threshold)
@@ -143,28 +163,92 @@ async def main() -> None:
                 "memory_id": entry.get("memory_id") or item.get("memory_id", ""),
                 "content": content, "schema_source": schema_source, "retrieval": entry,
             })
-        trace = {"candidate_ids": [item["memory_id"] for item in candidates], "selected_ids": [], "used": False, "solver_text": "", "injected_solver_views": []}
+        trace = {
+            "candidate_ids": [item["memory_id"] for item in candidates],
+            "selected_ids": [],
+            "used": False,
+            "solver_text": "",
+            "condition_cards": [],
+            "adapter_results": [],
+            "raw_principles": [],
+        }
         if not candidates:
             return trace
         with llm_request_context(f"stage3_{idx}", "application_gate"):
             gate = await plan.judge_memory_applicability(question, candidates[:args.gate_top_k])
         selected = set(gate.get("selected_ids", [])) if gate.get("protocol_compliant") else set()
-        accepted = [item for item in candidates if item["memory_id"] in selected][:args.max_injected]
+        accepted = [item for item in candidates if item["memory_id"] in selected]
+        adapted = []
+        adapter_results = []
+        judgments_by_id = {
+            str(item.get("memory_id", "")): item
+            for item in gate.get("judgments", [])
+            if isinstance(item, dict)
+        }
+        for item in accepted:
+            if len(adapted) >= args.max_injected:
+                break
+            with llm_request_context(f"stage3_{idx}", "memory_adapter/{item['memory_id']}"):
+                adapter = await plan.adapt_memory_for_question(
+                    question,
+                    item,
+                    judgments_by_id.get(item["memory_id"], {"accepted": False}),
+                )
+            adapter_results.append({
+                "memory_id": item["memory_id"],
+                "status": adapter.get("status", "reject"),
+                "schema_errors": adapter.get("schema_errors", []),
+                "reason": adapter.get("reason", ""),
+                "raw_response": adapter.get("raw_response", ""),
+                "source_principle": adapter.get("source_principle", item["content"]),
+                "condition_card": adapter.get("condition_card", {}),
+                "field_diff": {
+                    "trigger_to_when_to_consider": {
+                        "source": item["content"].get("trigger_condition", ""),
+                        "card": (adapter.get("condition_card") or {}).get("when_to_consider", ""),
+                    },
+                    "required_evidence_to_evidence_found": {
+                        "source": item["content"].get("required_evidence", []),
+                        "card": (adapter.get("condition_card") or {}).get("evidence_found", []),
+                    },
+                    "exclusion_to_do_not_use_if": {
+                        "source": item["content"].get("exclusion_condition", ""),
+                        "card": (adapter.get("condition_card") or {}).get("do_not_use_if", ""),
+                    },
+                    "failure_mode_to_failure_to_avoid": {
+                        "source": item["content"].get("failure_mode", ""),
+                        "card": (adapter.get("condition_card") or {}).get("failure_to_avoid", ""),
+                    },
+                    "action_to_suggested_action": {
+                        "source": item["content"].get("action_guidance", ""),
+                        "card": (adapter.get("condition_card") or {}).get("suggested_action", ""),
+                    },
+                    "verification_to_verification": {
+                        "source": item["content"].get("verification_step", ""),
+                        "card": (adapter.get("condition_card") or {}).get("verification", ""),
+                    },
+                },
+            })
+            if adapter.get("status") == "use" and adapter.get("condition_card"):
+                adapted.append({"memory_id": item["memory_id"], "card": adapter["condition_card"]})
+        solver_text = "\n\n".join(
+            render_solver_condition_card(item["card"], pos)
+            for pos, item in enumerate(adapted, 1)
+        )
         trace.update({
-            "gate": gate, "selected_ids": [item["memory_id"] for item in accepted],
-            "used": bool(accepted),
-            "injected_solver_views": [
-                {
-                    "memory_id": item["memory_id"],
-                    "lesson": item["content"]["introspection"],
-                    "action_guidance": item["content"]["action_guidance"],
-                    "verification_step": item["content"].get("verification_step", ""),
-                }
+            "gate": gate,
+            "selected_ids": [item["memory_id"] for item in adapted],
+            "used": bool(adapted),
+            "adapter_results": adapter_results,
+            "condition_cards": adapted,
+            "raw_principles": [
+                {"memory_id": item["memory_id"], "content": item["content"]}
                 for item in accepted
             ],
-            # Only the canonical solver view is rendered. Retrieval and routing
-            # metadata stay in this trace and never enter the Solver prompt.
-            "solver_text": "\n\n".join(render_solver_memory(item["content"], pos) for pos, item in enumerate(accepted, 1)),
+            # Only the adapter-produced condition card is rendered. Source
+            # question, source answer, memory ID, retrieval score, and Gate
+            # confidence stay in the trace and never enter the Solver prompt.
+            "solver_text": solver_text,
         })
         return trace
 
@@ -190,6 +274,10 @@ async def main() -> None:
                     "seed": seed, "temperature": args.temperature, "status": "complete",
                     "correct": check_answer_for_item(str(response.get("composed_output", "")), item),
                     "response": response, "transport_trace": trace,
+                    "solver_prompt": response.get("reasoner", {}).get("prompt", ""),
+                    "experience_decision": experience_decision(
+                        response.get("reasoner", {}).get("output", "")
+                    ) if response.get("guided") else "baseline",
                 }
         failure = {"idx": idx, "seed": seed, "variant": args.variant, "transport_trace": trace}
         transport_failures.append(failure)
@@ -221,39 +309,58 @@ async def main() -> None:
             with transport_path.open("w", encoding="utf-8") as handle:
                 for failure in transport_failures:
                     handle.write(json.dumps(failure, ensure_ascii=False) + "\n")
-            logger.info("completed %d/400 idx=%d pass1=%s pass3=%s", len(completed), idx, record["pass1_correct"], record["pass3_correct"])
+            logger.info("completed %d/%d idx=%d pass1=%s pass3=%s", len(completed), total_items, idx, record["pass1_correct"], record["pass3_correct"])
 
     await asyncio.gather(*(solve_item(idx, item) for idx, item in enumerate(test_data)))
     results = [completed[key] for key in sorted(completed)]
     seed_accuracy = {}
     for pos, seed in enumerate(SEEDS):
         correct = sum(bool(item["rollouts"][pos]["correct"]) for item in results)
-        seed_accuracy[str(seed)] = {"correct": correct, "total": 400, "accuracy": correct / 400}
+        seed_accuracy[str(seed)] = {"correct": correct, "total": total_items, "accuracy": correct / total_items if total_items else 0.0}
     summary = {
         "variant": args.variant, "solver_protocol_version": SOLVER_V1_PROTOCOL,
         "prompt_hashes": SOLVER_V1_PROMPT_HASHES, "memory_snapshot_hash": memory_hash,
-        "active_memory_count": active_memory_count, "total": 400,
+        "active_memory_count": active_memory_count, "total": total_items,
         "pass1_correct": sum(bool(item["pass1_correct"]) for item in results),
         "pass3_correct": sum(bool(item["pass3_correct"]) for item in results),
         "infrastructure_failure_count": sum(item.get("status") != "complete" for item in results),
         "retrieval_used_count": sum(bool((item.get("retrieval") or {}).get("used")) for item in results),
+        "retrieval_candidate_count": sum(len((item.get("retrieval") or {}).get("candidate_ids", [])) for item in results),
+        "application_gate_selected_count": sum(len((item.get("retrieval") or {}).get("raw_principles", [])) for item in results),
+        "adapter_attempt_count": sum(len((item.get("retrieval") or {}).get("adapter_results", [])) for item in results),
+        "adapter_accept_count": sum(len((item.get("retrieval") or {}).get("condition_cards", [])) for item in results),
+        "solver_use_count": sum(
+            rollout.get("experience_decision") == "use"
+            for item in results for rollout in item.get("rollouts", [])
+        ),
+        "solver_ignore_count": sum(
+            rollout.get("experience_decision") == "ignore"
+            for item in results for rollout in item.get("rollouts", [])
+        ),
+        "solver_decision_missing_count": sum(
+            rollout.get("experience_decision") == "missing"
+            for item in results for rollout in item.get("rollouts", [])
+        ),
         "seed_accuracy": seed_accuracy, "temperature": args.temperature, "seeds": list(SEEDS),
         "runtime_seconds": time.monotonic() - started,
     }
-    summary["pass1_accuracy"] = summary["pass1_correct"] / 400
-    summary["pass3_accuracy"] = summary["pass3_correct"] / 400
+    summary["pass1_accuracy"] = summary["pass1_correct"] / total_items if total_items else 0.0
+    summary["pass3_accuracy"] = summary["pass3_correct"] / total_items if total_items else 0.0
     atomic_save_json(output_dir / "eval_summary.json", summary)
     header = "\n".join([
         f"Variant: {args.variant}", f"Solver protocol: {SOLVER_V1_PROTOCOL}",
         f"Prompt hashes: {json.dumps(SOLVER_V1_PROMPT_HASHES, sort_keys=True)}",
         f"Memory snapshot/hash: {memory_hash}",
         f"Active Memory count: {active_memory_count}",
-        f"Pass@1 correct / 400: {summary['pass1_correct']} / 400",
+        f"Pass@1 correct / {total_items}: {summary['pass1_correct']} / {total_items}",
         f"Pass@1 accuracy: {summary['pass1_accuracy']:.6f}",
-        f"Pass@3 correct / 400: {summary['pass3_correct']} / 400",
+        f"Pass@3 correct / {total_items}: {summary['pass3_correct']} / {total_items}",
         f"Pass@3 accuracy: {summary['pass3_accuracy']:.6f}",
         f"Infrastructure failure count: {summary['infrastructure_failure_count']}",
         f"Retrieval-used count: {summary['retrieval_used_count']}",
+        f"Gate-selected memory count: {summary['application_gate_selected_count']}",
+        f"Adapter-accepted card count: {summary['adapter_accept_count']}",
+        f"Solver use / ignore / missing: {summary['solver_use_count']} / {summary['solver_ignore_count']} / {summary['solver_decision_missing_count']}",
         f"Runtime: {summary['runtime_seconds']:.1f}s", "",
     ])
     for handler in logging.getLogger().handlers:
