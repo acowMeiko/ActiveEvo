@@ -1,293 +1,375 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
+"""ActiveEvo project entry point.
+
+The pipeline is the user-facing controller. It keeps deployment separate in
+``api_call/`` and delegates actual Stage 1/2/3 work to core modules.
 """
-MemMetaV3 — 经验驱动的自进化推理框架
-====================================
+from __future__ import annotations
 
-统一入口文件。清晰展示三阶段 Agent 工作流：
-
-  Round N (N = 1, 2, 3, 4):
-  ┌─── Stage 1: 学习区挖掘 ────────────────────────────────────┐
-  │  execute.sample_unstable()    — 多次推理，发现 learning-zone  │
-  │  execute.mine_hard_negatives() — 挖掘困难负样本               │
-  │  plan.extract_semantics()      — 三维语义特征提取             │
-  │  plan.diff_analysis()          — 正确/错误路径差异分析         │
-  └───────────────────────────────────────────────────────────────┘
-                                  ↓
-  ┌─── Stage 2: 记忆构建 ─────────────────────────────────────────┐
-  │  memory.ingest()              — 经验入库 + 去重               │
-  │  memory.build_indices()       — FAISS 三维向量索引            │
-  │  memory.save() + snapshot()   — 持久化 + 快照                │
-  └───────────────────────────────────────────────────────────────┘
-                                  ↓
-  ┌─── Stage 3: 检索增强评估 ─────────────────────────────────────┐
-  │  plan.extract_semantics()     — 提取测试题语义特征            │
-  │  memory.retrieve()            — 三维门控检索匹配经验          │
-  │  execute.answer_guided()      — 经验引导答题                 │
-  │  execute.check_answer()       — 答案校验                    │
-  └───────────────────────────────────────────────────────────────┘
-
-四轮课程学习: Round 1 → Round 2 → Round 3 → Round 4
-记忆跨轮增量保留: Round N 的记忆 = Round 1..N-1 全量 + Round N 新增
-
-用法:
-    # 全流程四轮 (4卡服务器部署)
-    python pipeline.py --levels 1 2 3 4 --ports 8100 8101 8102 8103
-
-  # 全流程四轮 (单卡本地测试)
-  python pipeline.py --levels 1 2 3 4 --local
-
-  # 仅跑指定 Stage
-  python pipeline.py --stage 1 -d dpo_level1 --ports 8100 8101
-  python pipeline.py --stage 2 -d dpo_level1
-  python pipeline.py --stage 3 -d dpo_level1 --ports 8100
-
-  # 跳过采样和挖掘 (复用已有 Stage 1 中间结果)
-  python pipeline.py --levels 1 --skip-sampling --skip-mining
-"""
 import argparse
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
 import sys
+from types import SimpleNamespace
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Sequence
 
-from core.config import Config
 from core.agent_pipeline import AgentPipeline
-from output_paths import stage3_progress_state_file
-from utils.io_utils import load_json, save_json
+from core.config import Config
+from modules.memory_module import MemoryModule
+from modules.stage2 import build_level_memory
 
 logger = logging.getLogger(__name__)
 
 
-def _dataset_level(dataset: str) -> int:
-    text = str(dataset or "")
-    match = re.search(r"dpo_level(\d+)", text)
-    if match:
-        return int(match.group(1))
-    return 1
+LEVEL_PATTERN = re.compile(r"level([1-4])$")
 
 
-def _stage3_test_scope_key(test_input: Optional[str]) -> str:
-    if not test_input:
-        return "default"
-    path = Path(str(test_input))
-    parent = path.parent.name if path.parent.name else "root"
-    stem = path.stem or "dataset"
-    return f"{parent}_{stem}"
+def _level_number(level: str | int) -> int:
+    text = str(level).strip().lower()
+    if text.isdigit() and 1 <= int(text) <= 4:
+        return int(text)
+    match = LEVEL_PATTERN.fullmatch(text)
+    if not match:
+        raise argparse.ArgumentTypeError(
+            f"Unsupported level {level!r}; use level1, level2, level3, or level4."
+        )
+    return int(match.group(1))
 
 
-# ════════════════════════════════════════════════════════════════
-# CLI 参数解析
-# ════════════════════════════════════════════════════════════════
+def _public_level(level: str | int) -> str:
+    return f"level{_level_number(level)}"
 
-def parse_args():
+
+def _default_output_dir(config: Config, variant: str) -> Path:
+    return config.paths.output_dir / "stage3" / variant
+
+
+def _python_executable() -> str:
+    return sys.executable or "python"
+
+
+def apply_pipeline_environment(config: Config) -> None:
+    defaults = config.pipeline
+    os.environ.setdefault("MEMUA_EMBEDDING_DEVICE", defaults.embedding_device)
+    os.environ.setdefault("MEMUA_EMBEDDING_MODEL", defaults.embedding_model)
+    os.environ.setdefault("MEMUA_EMBEDDING_MODEL_PATH", str(config.paths.embedding_model_dir))
+    os.environ.setdefault("MEMUA_FORCE_EMBEDDING", defaults.force_embedding)
+    os.environ.setdefault("MEMUA_ALLOW_HASH_FALLBACK", defaults.allow_hash_fallback)
+
+
+def subprocess_environment(config: Config) -> dict[str, str]:
+    env = os.environ.copy()
+    defaults = config.pipeline
+    env.setdefault("MEMUA_EMBEDDING_DEVICE", defaults.embedding_device)
+    env.setdefault("MEMUA_EMBEDDING_MODEL", defaults.embedding_model)
+    env.setdefault("MEMUA_EMBEDDING_MODEL_PATH", str(config.paths.embedding_model_dir))
+    env.setdefault("MEMUA_FORCE_EMBEDDING", defaults.force_embedding)
+    env.setdefault("MEMUA_ALLOW_HASH_FALLBACK", defaults.allow_hash_fallback)
+    return env
+
+
+def _add_common_runtime_args(parser: argparse.ArgumentParser, config: Config) -> None:
+    defaults = config.pipeline
+    parser.add_argument(
+        "--ports",
+        type=int,
+        nargs="+",
+        default=list(defaults.default_ports),
+        help="OpenAI-compatible local endpoint ports. Deployment is managed by api_call/.",
+    )
+    parser.add_argument("--model", default=defaults.default_model, help="Served model name.")
+    parser.add_argument("--timeout", type=int, default=defaults.request_timeout)
+
+
+def build_parser(config: Config) -> argparse.ArgumentParser:
+    defaults = config.pipeline
     parser = argparse.ArgumentParser(
-        description="MemMetaV3 — 经验驱动的自进化推理框架",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  python pipeline.py --levels 1 2 3 4 --ports 8100 8101 8102 8103
-  python pipeline.py --levels 1 2 3 4 --local
-  python pipeline.py --stage 1 -d dpo_level1 --ports 8100 8101
-  python pipeline.py --stage 3 -d dpo_level1
-""",
+        prog="pipeline.py",
+        description="ActiveEvo three-stage controller.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    stage1 = subparsers.add_parser("stage1", help="Build capability-signal learning packets.")
+    stage1.add_argument("--dataset", default=defaults.stage1_dataset_path, required=not bool(defaults.stage1_dataset_path))
+    stage1.add_argument("--expected-dataset-sha256", default=defaults.stage1_expected_dataset_sha256)
+    stage1.add_argument("--expected-dataset-size", type=int, default=defaults.stage1_expected_dataset_size)
+    stage1.add_argument("--k-trials", type=int, default=defaults.stage1_k_trials)
+    stage1.add_argument("--experiment-seed", type=int, default=defaults.stage1_experiment_seed)
+    stage1.add_argument("--temperature", type=float, default=defaults.stage1_temperature)
+    stage1.add_argument("--top-p", type=float, default=defaults.stage1_top_p)
+    stage1.add_argument("--top-logprobs", type=int, default=defaults.stage1_top_logprobs)
+    stage1.add_argument("--entropy-histogram-bins", type=int, default=defaults.stage1_entropy_histogram_bins)
+    stage1.add_argument("--max-tokens", type=int, default=defaults.stage1_max_tokens)
+    stage1.add_argument("--backbone", default=defaults.default_backbone)
+    stage1.add_argument("--concurrency", type=int, default=defaults.stage1_concurrency)
+    stage1.add_argument("--task-batch-size", type=int, default=defaults.stage1_task_batch_size)
+    stage1.add_argument("--skip-sampling", action="store_true")
+    stage1.add_argument("--resume", action="store_true")
+    _add_common_runtime_args(stage1, config)
+
+    stage2 = subparsers.add_parser("stage2", help="Generate and quality-audit memories.")
+    stage2.add_argument("--level", default="level1", type=_public_level, choices=list(defaults.public_levels))
+    stage2.add_argument("--memory-dir", default=defaults.default_memory_dir)
+    stage2.add_argument("--backbone", default=defaults.default_backbone)
+    stage2.add_argument("--model-concurrency", type=int, default=defaults.stage2_concurrency)
+    stage2.add_argument("--limit", type=int, default=0, help="Maximum candidate count; 0 means all.")
+    stage2.add_argument("--run-tag", default="", help="Optional artifact isolation tag.")
+    stage2.add_argument("--prepare-candidates-only", action="store_true")
+    stage2.add_argument("--candidate-bank", default="", help="Frozen candidate bank JSON.")
+    stage2.add_argument("--selection-file", default="", help="Stable sampled question IDs.")
+    stage2.add_argument("--output-dir", default="", help="Stage 2 audit artifact directory.")
+
+    stage3 = subparsers.add_parser("stage3", help="Evaluate baseline or memory-guided solving.")
+    stage3.add_argument("--variant", choices=["baseline", "guided"], default="guided")
+    stage3.add_argument("--test-file", default=defaults.default_test_file)
+    stage3.add_argument("--memory-dir", default=defaults.default_memory_dir)
+    stage3.add_argument("--output-dir", default="")
+    stage3.add_argument("--concurrency", type=int, default=defaults.stage3_concurrency)
+    stage3.add_argument("--temperature", type=float, default=defaults.default_temperature)
+    stage3.add_argument("--threshold", type=float, default=defaults.stage3_threshold)
+    stage3.add_argument("--candidate-top-k", type=int, default=defaults.stage3_candidate_top_k)
+    stage3.add_argument("--gate-top-k", type=int, default=defaults.stage3_gate_top_k)
+    stage3.add_argument("--max-injected", type=int, default=defaults.stage3_max_injected)
+    stage3.add_argument("--limit", type=int, default=0, help="Smoke-test prefix size.")
+    _add_common_runtime_args(stage3, config)
+
+    full = subparsers.add_parser("all", help="Run Stage 1/2/3 over multiple levels.")
+    full.add_argument("--levels", nargs="+", default=list(defaults.public_levels), type=_public_level)
+    full.add_argument("--dataset", default=defaults.stage1_dataset_path)
+    full.add_argument("--memory-dir", default=defaults.default_memory_dir)
+    full.add_argument("--test-file", default=defaults.default_test_file)
+    full.add_argument("--concurrency", type=int, default=defaults.stage1_concurrency)
+    full.add_argument("--stage2-concurrency", type=int, default=defaults.stage2_concurrency)
+    full.add_argument("--eval-concurrency", type=int, default=defaults.stage3_concurrency)
+    full.add_argument("--threshold", type=float, default=defaults.stage3_threshold)
+    full.add_argument("--top-k", type=int, default=5)
+    full.add_argument("--skip-sampling", action="store_true")
+    _add_common_runtime_args(full, config)
+
+    return parser
+
+
+def build_agent_pipeline(args: argparse.Namespace, config: Config) -> AgentPipeline:
+    return AgentPipeline(
+        config=config,
+        ports=getattr(args, "ports", None),
+        model_override=getattr(args, "model", None),
+        memory_dir=getattr(args, "memory_dir", config.pipeline.default_memory_dir),
+        timeout=getattr(args, "timeout", config.pipeline.request_timeout),
     )
 
-    # 运行模式
-    parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 3, 4],
-                        help="课程学习轮次 (默认: 1 2 3 4)")
-    parser.add_argument("--stage", type=int, choices=[1, 2, 3], default=None,
-                        help="仅运行指定 Stage (需配合 -d)")
-    parser.add_argument("--dataset", "-d", type=str, default=None,
-                        help="指定数据集 (如 dpo_level1, 与 --stage 配合)")
 
-    # 部署模式
-    parser.add_argument("--local", action="store_true",
-                        help="单卡本地 vLLM 测试模式 (端口 8000)")
-    parser.add_argument("--ports", type=int, nargs="+", default=None,
-                        help="多卡部署端口 (如: 8000 8001 8002 ...)")
-    parser.add_argument("--model", "-m", type=str, default=None,
-                        help="覆盖模型名称")
-    parser.add_argument("--backbone", type=str, default=os.environ.get("MEMUA_BACKBONE", ""),
-                        help="Stage 1/2 产物标签，例如 llama")
-
-    # 测试与记忆
-    parser.add_argument("--test-input", type=str, default=None,
-                        help="测试集路径")
-    parser.add_argument("--memory-dir", type=str, default="memory/v3",
-                        help="外部记忆目录")
-
-    # Stage 1 参数
-    parser.add_argument("--concurrency", type=int, default=10)
-    parser.add_argument("--diff-concurrency", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=5)
-    parser.add_argument("--max-trials", type=int, default=15)
-    parser.add_argument("--skip-sampling", action="store_true")
-    parser.add_argument("--skip-mining", action="store_true")
-
-    # Stage 3 参数
-    parser.add_argument("--eval-concurrency", type=int, default=10)
-    parser.add_argument("--stage2-concurrency", type=int, default=8,
-                        help="Stage 2 验证并发数")
-    parser.add_argument("--stage2-candidate-concurrency", type=int, default=0,
-                        help="Stage 2 端到端候选 worker 数；0 使用环境配置或 generation 并发")
-    parser.add_argument("--stage2-limit", type=int, default=0,
-                        help="Stage 2 最多处理多少个候选；0 表示全部")
-    parser.add_argument("--stage2-run-tag", type=str, default="",
-                        help="Stage 2 输出隔离标签，例如 smoke10 或 pilot30")
-    parser.add_argument("--dsd-cache-dir", type=str, default="",
-                        help="可复用的 DSD/BGE 缓存目录")
-    parser.add_argument("--rebuild-dsd", action="store_true",
-                        help="忽略现有 DSD 缓存并重建")
-    parser.add_argument("--prepare-dsd-only", action="store_true",
-                        help="只构建/检查 DSD 缓存")
-    parser.add_argument("--prepare-candidates-only", action="store_true",
-                        help="只生成并冻结 Quality-pass 候选")
-    parser.add_argument("--candidate-bank", type=str, default="",
-                        help="冻结候选银行 JSON 路径")
-    parser.add_argument("--neighbor-validation", choices=["on", "off", "gate-only"], default="on",
-                        help="Stage 2 Neighbor Validation 消融开关")
-    parser.add_argument("--stage2-selection-file", type=str, default="",
-                        help="只处理 JSON 中列出的 question_id；用于稳定分层 Pilot")
-    parser.add_argument("--stage2-output-dir", type=str, default="",
-                        help="Stage 2 审计产物隔离目录")
-    parser.add_argument("--threshold", type=float, default=0.55)
-    parser.add_argument("--top-k", type=int, default=5)
-
-    # 其他
-    parser.add_argument("--timeout", type=int, default=600)
-
-    return parser.parse_args()
-
-
-# ════════════════════════════════════════════════════════════════
-# 核心编排
-# ════════════════════════════════════════════════════════════════
-
-async def run_single_stage(pipeline: AgentPipeline, args, config: Config):
-    """单 Stage 模式。"""
-    dataset = args.dataset or "dpo_level1"
-    level = _dataset_level(dataset)
-
-    if args.stage == 1:
-        logger.info("═══ Stage 1: 学习区挖掘 (统一数据集) ═══")
-        await pipeline.stage1_learn(
-            concurrency=args.concurrency,
-            skip_sampling=args.skip_sampling,
+def validate_stage1_inputs(args: argparse.Namespace) -> None:
+    dataset = Path(args.dataset)
+    if not dataset.is_file():
+        raise FileNotFoundError(f"Stage 1 dataset not found: {dataset}")
+    actual_hash = hashlib.sha256(dataset.read_bytes()).hexdigest()
+    if args.expected_dataset_sha256 and actual_hash != args.expected_dataset_sha256:
+        raise ValueError(
+            f"Dataset SHA-256 mismatch: expected {args.expected_dataset_sha256}, got {actual_hash}"
         )
-
-    elif args.stage == 2:
-        logger.info("═══ Stage 2: 记忆构建 (%s, round=%d) ═══", dataset, level)
-        await pipeline.stage2_memorize(
-            dataset=dataset,
-            round_id=level,
-            validation_concurrency=args.stage2_concurrency,
-            backbone=args.backbone,
-            max_records=args.stage2_limit,
-            run_tag=args.stage2_run_tag,
-            dsd_cache_dir=args.dsd_cache_dir,
-            rebuild_dsd=args.rebuild_dsd,
-            prepare_dsd_only=args.prepare_dsd_only,
-            prepare_candidates_only=args.prepare_candidates_only,
-            candidate_bank=args.candidate_bank,
-            neighbor_validation=args.neighbor_validation != "off",
-            gate_only=args.neighbor_validation == "gate-only",
-            selection_file=args.stage2_selection_file,
-            artifact_dir=args.stage2_output_dir,
-            candidate_concurrency=args.stage2_candidate_concurrency,
+    payload = json.loads(dataset.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or len(payload) != args.expected_dataset_size:
+        raise ValueError(
+            f"Stage 1 requires {args.expected_dataset_size} records; got "
+            f"{len(payload) if isinstance(payload, list) else type(payload).__name__}"
         )
-
-    elif args.stage == 3:
-        logger.info("═══ Stage 3: 检索增强评估 (%s) ═══", dataset)
-        test_path = args.test_input or str(config.paths.test_dir / "deepscaler.json")
-        test_data = load_json(test_path)
-        test_scope_key = _stage3_test_scope_key(test_path)
-        result = await pipeline.stage3_evaluate(
-            test_data=test_data,
-            threshold=args.threshold,
-            top_k=args.top_k,
-            concurrency=args.eval_concurrency,
-            eval_level=level,
-            dataset=dataset,
-            progress_state_path=stage3_progress_state_file(config.paths.output_dir, test_scope_key),
-            test_scope_key=test_scope_key,
+    missing = [index for index, item in enumerate(payload) if not isinstance(item, dict) or any(
+        not str(item.get(field, "")).strip() for field in ("question", "answer", "difficulty_level")
+    )]
+    if missing:
+        logger.warning(
+            "Stage 1 will retain %d invalid input record(s) outside Master/Learning/Panic: %s",
+            len(missing), missing[:10],
         )
-        from output_paths import stage3_guided_results_file, stage3_guided_summary_file
-        out_root = config.paths.output_dir
-        save_json(result["results"], str(stage3_guided_results_file(out_root, dataset)))
-        save_json(result["summary"], str(stage3_guided_summary_file(out_root, dataset)))
+    if args.skip_sampling:
+        return
+    if len(args.ports) != 4:
+        raise ValueError(f"Stage 1 expects exactly four actor endpoints; got ports={args.ports}")
+    from modules.execute_module import is_url_reachable
+    dead = [port for port in args.ports if not is_url_reachable(f"http://127.0.0.1:{port}")]
+    if dead:
+        raise RuntimeError(f"Stage 1 actor endpoints are not reachable: {dead}")
 
 
-async def run_full_curriculum(pipeline: AgentPipeline, args, config: Config):
-    """全流程四轮课程学习。
-
-    每轮流程:
-      Stage 1: 能力感知的样本分区与正负对构造
-        1.1 execute.sample_unstable()     — K次推理，三分区 (Learning/Master/Panic)
-        1.2 execute.mine_hard_negatives() — 逐步前缀分叉分数挖掘正负样本对
-        1.3 封装 learning_pairs           — 含 zone 标签 + divergence info
-
-      Stage 2: 记忆构建
-        2.1 memory.load()                 — 加载前轮记忆 (增量)
-        2.2 memory.ingest()               — 提取经验入库 + 去重
-        2.3 memory.build_indices()        — 三维 FAISS 索引
-        2.4 memory.save() + snapshot()    — 持久化 + 快照
-
-      Stage 3: 检索增强评估 + 学习闭环
-        3.1 plan.extract_semantics()      — 提取测试题三维语义
-        3.2 memory.retrieve()             — 三维门控检索 (importance_score 加权)
-        3.3 execute.answer_guided()       — 经验引导答题
-        3.4 record_feedback()             — 实时更新 principle 重要性
-        3.5 execute.check_answer()        — 答案校验 + 汇总
-    """
-    summaries = await pipeline.run_full_curriculum(
-        levels=args.levels,
-        test_input=args.test_input,
+async def run_stage1(args: argparse.Namespace, config: Config) -> None:
+    validate_stage1_inputs(args)
+    pipeline = build_agent_pipeline(args, config)
+    logger.info("Stage 1 started: sampling once and producing level1-level4 learning bundles")
+    await pipeline.stage1_learn(
+        dataset_path=args.dataset,
         concurrency=args.concurrency,
-        stage2_concurrency=args.stage2_concurrency,
-        eval_concurrency=args.eval_concurrency,
-        threshold=args.threshold,
-        top_k=args.top_k,
+        k_trials=args.k_trials,
+        experiment_seed=args.experiment_seed,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_logprobs=args.top_logprobs,
+        entropy_histogram_bins=args.entropy_histogram_bins,
+        max_tokens=args.max_tokens,
+        task_batch_size=args.task_batch_size,
+        expected_dataset_sha256=args.expected_dataset_sha256,
+        expected_dataset_size=args.expected_dataset_size,
         skip_sampling=args.skip_sampling,
+        backbone=args.backbone,
+        resume=args.resume,
     )
-    return summaries
+    logger.info("Stage 1 completed: level1-level4")
 
 
-# ════════════════════════════════════════════════════════════════
-# 入口
-# ════════════════════════════════════════════════════════════════
+async def run_stage2(args: argparse.Namespace, config: Config) -> None:
+    runtime = SimpleNamespace(
+        config=config,
+        memory=MemoryModule(config, memory_dir=args.memory_dir),
+    )
+    level = _public_level(args.level)
+    round_id = _level_number(level)
+    dataset = level
+    logger.info("Stage 2 Memory Factory started: %s", level)
+    await build_level_memory(
+        runtime,
+        level=dataset,
+        round_id=round_id,
+        model_concurrency=args.model_concurrency,
+        backbone=args.backbone,
+        max_records=args.limit,
+        run_tag=args.run_tag,
+        prepare_candidates_only=args.prepare_candidates_only,
+        candidate_bank=args.candidate_bank,
+        selection_file=args.selection_file,
+        artifact_dir=args.output_dir,
+    )
+    logger.info("Stage 2 completed: %s", level)
 
-async def main():
-    args = parse_args()
 
-    # 初始化配置
+async def run_stage3(args: argparse.Namespace, config: Config) -> None:
+    output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir(config, args.variant)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        _python_executable(),
+        "scripts/stage3/evaluate.py",
+        "--variant",
+        args.variant,
+        "--test-file",
+        args.test_file,
+        "--output-dir",
+        str(output_dir),
+        "--ports",
+        *[str(port) for port in args.ports],
+        "--model",
+        args.model,
+        "--concurrency",
+        str(args.concurrency),
+        "--temperature",
+        str(args.temperature),
+        "--threshold",
+        str(args.threshold),
+        "--candidate-top-k",
+        str(args.candidate_top_k),
+        "--gate-top-k",
+        str(args.gate_top_k),
+        "--max-injected",
+        str(args.max_injected),
+    ]
+    if args.variant == "guided":
+        command.extend(["--memory-dir", args.memory_dir])
+    if args.limit:
+        command.extend(["--limit", str(args.limit)])
+
+    logger.info("Stage 3 started: %s", args.variant)
+    process = await asyncio.create_subprocess_exec(*command, env=subprocess_environment(config))
+    return_code = await process.wait()
+    if return_code != 0:
+        raise RuntimeError(f"Stage 3 evaluator failed with exit code {return_code}")
+    logger.info("Stage 3 completed: %s -> %s", args.variant, output_dir)
+
+
+async def run_all(args: argparse.Namespace, config: Config) -> None:
+    levels = [_public_level(level) for level in args.levels]
+    if not args.skip_sampling:
+        if not args.dataset:
+            raise ValueError("--dataset is required unless --skip-sampling is used")
+        stage1_args = argparse.Namespace(
+            command="stage1",
+            dataset=args.dataset,
+            expected_dataset_sha256=config.pipeline.stage1_expected_dataset_sha256,
+            expected_dataset_size=config.pipeline.stage1_expected_dataset_size,
+            k_trials=config.pipeline.stage1_k_trials,
+            experiment_seed=config.pipeline.stage1_experiment_seed,
+            temperature=config.pipeline.stage1_temperature,
+            top_p=config.pipeline.stage1_top_p,
+            top_logprobs=config.pipeline.stage1_top_logprobs,
+            entropy_histogram_bins=config.pipeline.stage1_entropy_histogram_bins,
+            max_tokens=config.pipeline.stage1_max_tokens,
+            concurrency=args.concurrency,
+            task_batch_size=config.pipeline.stage1_task_batch_size,
+            skip_sampling=False,
+            resume=False,
+            backbone=config.pipeline.default_backbone,
+            ports=args.ports,
+            model=args.model,
+            timeout=args.timeout,
+        )
+        await run_stage1(stage1_args, config)
+
+    for level in levels:
+        stage2_args = argparse.Namespace(
+            command="stage2",
+            level=level,
+            memory_dir=args.memory_dir,
+            backbone=config.pipeline.default_backbone,
+            model_concurrency=args.stage2_concurrency,
+            limit=0,
+            run_tag="",
+            prepare_candidates_only=False,
+            candidate_bank="",
+            selection_file="",
+            output_dir="",
+        )
+        await run_stage2(stage2_args, config)
+
+    stage3_args = argparse.Namespace(
+        command="stage3",
+        variant="guided",
+        test_file=args.test_file,
+        memory_dir=args.memory_dir,
+        output_dir="",
+        concurrency=args.eval_concurrency,
+        temperature=config.pipeline.default_temperature,
+        threshold=args.threshold,
+        candidate_top_k=args.top_k,
+        gate_top_k=config.pipeline.stage3_gate_top_k,
+        max_injected=config.pipeline.stage3_max_injected,
+        limit=0,
+        ports=args.ports,
+        model=args.model,
+        timeout=args.timeout,
+    )
+    await run_stage3(stage3_args, config)
+    logger.info("All stages completed: %s", ", ".join(levels))
+
+
+async def main() -> None:
     config = Config.from_core_file()
+    args = build_parser(config).parse_args()
+    apply_pipeline_environment(config)
     config.ensure_dirs()
     config.setup_logging()
 
-    # 确定部署模式
-    ports = args.ports
-    if args.local and not ports:
-        ports = [8000]  # 单卡本地 vLLM 端口
-        logger.info("单卡本地测试模式 (port=8000)")
-
-    # 构建 Agent Pipeline
-    pipeline = AgentPipeline(
-        config=config,
-        ports=ports,
-        model_override=args.model,
-        memory_dir=args.memory_dir,
-        timeout=args.timeout,
-    )
-
-    # 分发
-    if args.stage is not None:
-        await run_single_stage(pipeline, args, config)
+    if args.command == "stage1":
+        await run_stage1(args, config)
+    elif args.command == "stage2":
+        await run_stage2(args, config)
+    elif args.command == "stage3":
+        await run_stage3(args, config)
+    elif args.command == "all":
+        await run_all(args, config)
     else:
-        summaries = await run_full_curriculum(pipeline, args, config)
-        logger.info("全部完成! 各轮摘要: %s", summaries)
+        raise ValueError(f"Unsupported command: {args.command}")
 
 
 if __name__ == "__main__":

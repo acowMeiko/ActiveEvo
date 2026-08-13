@@ -1,5 +1,13 @@
 # Python
 __pycache__/
+models/actor/*
+models/generator/*
+models/auditor/*
+models/embedding/*
+!models/actor/.gitkeep
+!models/generator/.gitkeep
+!models/auditor/.gitkeep
+!models/embedding/.gitkeep
 *.py[cod]
 .pytest_cache/
 .mypy_cache/

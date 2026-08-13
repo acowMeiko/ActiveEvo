@@ -1,0 +1,17 @@
+# Independent Stage-2 auditor. Copy to auditor.conf and select available GPUs.
+PYTHON_BIN=/path/to/python
+HOST=0.0.0.0
+DEPLOY_MODEL=qwen
+DEPLOY_GPU_IDS="4"
+DEPLOY_PORT_BASE=8196
+DEPLOY_SERVER_SEED=42
+DEPLOY_READY_TIMEOUT=900
+LLAMA_PATH=/path/to/ActiveEvo/models/auditor
+QWEN_PATH=/path/to/ActiveEvo/models/auditor  # Qwen3.5-27B-FP8 recommended on a 48GB GPU
+TENSOR_PARALLEL_SIZE=1
+GPU_MEMORY_UTILIZATION=0.90
+MAX_MODEL_LEN=32768
+MAX_NUM_SEQS=16
+DTYPE=bfloat16
+VLLM_EXTRA_ARGS="--enforce-eager --trust-remote-code"
+LOG_DIR=logs/auditor

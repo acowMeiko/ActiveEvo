@@ -35,16 +35,6 @@ def stage1_principle_file(root: Path, dataset: str) -> Path:
     return stage_output_dir(root, "stage1", dataset, "03_dpo") / "principle_dataset.json"
 
 
-def stage1_principle_dpo_file(root: Path, dataset: str) -> Path:
-    """旧流程产物文件名 (backward compat)."""
-    return stage_output_dir(root, "stage1", dataset, "03_dpo") / "principle_dpo_dataset.json"
-
-
-def stage1_dpo_file(root: Path, dataset: str) -> Path:
-    """Deprecated: use stage1_principle_file instead."""
-    return stage1_principle_file(root, dataset)
-
-
 def stage1_diff_failed_file(root: Path, dataset: str) -> Path:
     return stage_output_dir(root, "stage1", dataset, "03_dpo") / "diff_failed.json"
 

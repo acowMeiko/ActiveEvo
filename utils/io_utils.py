@@ -22,3 +22,13 @@ def save_json(data, path, encoding="utf-8", indent=2) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding=encoding) as f:
         json.dump(data, f, indent=indent, ensure_ascii=False)
+
+
+def atomic_save_json(path, data, encoding="utf-8", indent=2) -> None:
+    """Atomically replace a JSON artifact after a complete write."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with open(temporary, "w", encoding=encoding) as handle:
+        json.dump(data, handle, indent=indent, ensure_ascii=False)
+    temporary.replace(path)

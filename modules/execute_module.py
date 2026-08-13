@@ -241,10 +241,10 @@ class ExecuteModule:
         exe = ExecuteModule(config, ports=[8000, 8001, ...])
 
         # Stage 1: 不稳定样本采样
-        sampling_path = await exe.sample_unstable("dpo_level1", concurrency=10)
+        sampling_path = await exe.sample_unstable("level1", concurrency=10)
 
         # Stage 1: 困难负样本挖掘
-        mining_path = exe.mine_hard_negatives("dpo_level1")
+        mining_path = exe.mine_hard_negatives("level1")
 
         # Stage 3: 答题
         answer = await exe.answer_direct(question)
@@ -487,7 +487,7 @@ class ExecuteModule:
         Returns: 输出文件路径 (sampling_results.json)，失败返回 None
         """
         from sample_unstable_questions import ModelTester
-        from output_paths import stage1_sampling_file
+        from utils.output_paths import stage1_sampling_file
 
         tester = ModelTester(self.config, dataset, urls=self.urls)
         tester.model = self.model
@@ -527,7 +527,7 @@ class ExecuteModule:
         Returns: 输出文件路径，失败返回 None
         """
         from hard_negative_mining import HardNegativeMiner
-        from output_paths import stage1_sampling_file, stage1_mining_file
+        from utils.output_paths import stage1_sampling_file, stage1_mining_file
 
         if sampling_path is None:
             sampling_path = stage1_sampling_file(self.config.paths.output_dir, dataset)

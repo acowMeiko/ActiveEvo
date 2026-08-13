@@ -119,7 +119,19 @@ def _normalized_entropy_from_top_logprobs(top_entries: list) -> Optional[float]:
     return max(0.0, min(1.0, entropy / max_entropy))
 
 
-def _logprob_entropy_summary(data: Dict[str, Any]) -> Dict[str, Any]:
+def _percentile(values: list[float], fraction: float) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = (len(ordered) - 1) * fraction
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (position - lower)
+
+
+def _logprob_entropy_summary(data: Dict[str, Any], histogram_bins: int = 20) -> Dict[str, Any]:
     entries = _iter_logprob_entries(data)
     token_entropies = []
     token_logprobs = []
@@ -136,17 +148,42 @@ def _logprob_entropy_summary(data: Dict[str, Any]) -> Dict[str, Any]:
             token_entropies.append(entropy)
             available_top_k.append(len(top_entries))
 
-    normalized_entropy = sum(token_entropies) / len(token_entropies) if token_entropies else 1.0
+    normalized_entropy = sum(token_entropies) / len(token_entropies) if token_entropies else None
     avg_neg_logprob = -sum(token_logprobs) / len(token_logprobs) if token_logprobs else None
+    bins = max(1, int(histogram_bins))
+    histogram = [0] * bins
+    for value in token_entropies:
+        histogram[min(int(value * bins), bins - 1)] += 1
+    mean = normalized_entropy
+    variance = (
+        sum((value - mean) ** 2 for value in token_entropies) / len(token_entropies)
+        if token_entropies and mean is not None else None
+    )
+    top_mass_values = []
+    for entry in entries:
+        values = [math.exp(value) for value in (
+            _coerce_logprob(item.get("logprob")) for item in _top_logprobs_from_entry(entry)
+        ) if value is not None]
+        if values:
+            top_mass_values.append(min(1.0, sum(values)))
     return {
         "available": bool(token_entropies),
-        "normalized_entropy": max(0.0, min(1.0, normalized_entropy)),
-        "trajectory_entropy": max(0.0, min(1.0, normalized_entropy)),
+        "normalized_entropy": max(0.0, min(1.0, normalized_entropy)) if normalized_entropy is not None else None,
+        "trajectory_entropy": max(0.0, min(1.0, normalized_entropy)) if normalized_entropy is not None else None,
+        "std": math.sqrt(variance) if variance is not None else None,
+        "p25": _percentile(token_entropies, 0.25),
+        "p50": _percentile(token_entropies, 0.50),
+        "p75": _percentile(token_entropies, 0.75),
+        "p90": _percentile(token_entropies, 0.90),
+        "histogram": {"bins": bins, "range": [0.0, 1.0], "counts": histogram},
         "token_count": len(entries),
         "entropy_token_count": len(token_entropies),
+        "coverage": len(token_entropies) / len(entries) if entries else 0.0,
         "avg_neg_logprob": avg_neg_logprob,
+        "chosen_token_mean_surprisal": avg_neg_logprob,
+        "avg_top_k_probability_mass": sum(top_mass_values) / len(top_mass_values) if top_mass_values else None,
         "avg_top_logprobs": sum(available_top_k) / len(available_top_k) if available_top_k else 0.0,
-        "method": "top_logprobs_normalized_entropy" if token_entropies else "unavailable_default_max_entropy",
+        "method": "top_logprobs_normalized_entropy" if token_entropies else "unavailable",
     }
 
 
@@ -156,12 +193,13 @@ def _metadata_response(
     duration_sec: float,
     include_raw: bool = False,
     record_metrics: bool = True,
+    histogram_bins: int = 20,
 ) -> Dict[str, Any]:
     text = _parse_response(data)
     result = {
         "text": text,
         "usage": data.get("usage") if isinstance(data, dict) else None,
-        "entropy": _logprob_entropy_summary(data if isinstance(data, dict) else {}),
+        "entropy": _logprob_entropy_summary(data if isinstance(data, dict) else {}, histogram_bins),
         "duration_sec": duration_sec,
     }
     if include_raw:
@@ -334,6 +372,7 @@ async def async_llm_call_with_metadata(
     session: Optional["aiohttp.ClientSession"] = None,
     request_logprobs: bool = True,
     top_logprobs: int = 5,
+    entropy_histogram_bins: int = 20,
     include_raw: bool = False,
     **kwargs
 ) -> Dict[str, Any]:
@@ -384,7 +423,7 @@ async def async_llm_call_with_metadata(
                             prompt,
                             data,
                             time.perf_counter() - attempt_start,
-                            include_raw=include_raw,
+                            include_raw=include_raw, histogram_bins=entropy_histogram_bins,
                         )
                         if not result["text"]:
                             logger.warning(

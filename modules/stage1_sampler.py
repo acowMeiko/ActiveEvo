@@ -1,164 +1,59 @@
+"""Stage 1 capability-frontier sampling.
+
+Accuracy is the only signal used to assign levels. Token uncertainty is kept
+as an orthogonal, auditable signal for ranking questions *within* a level.
 """
-modules/stage1_sampler.py — Stage 1 第一阶段：能力边界感知
-
-K-trial 随机采样 → 成功率(SR)计算 → 空间拓扑划分 → level 划分
-
-早停策略: 连续 5 次正确 → 提前终止, SR=1.0, 归入 Master Zone
-
-Zone 分类:
-  - Master Zone  (Z_M): SR = 1.0   — 已征服,无需进化
-  - Learning Zone (Z_L): 0 < SR < 1 — 当前进化领土
-  - Panic Zone   (Z_P): SR = 0     — 暂时无法解决
-
-Learning Zone 按 correct_count 排序等分为 4 个 level.
-"""
+from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
-import os
-import re
+import math
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence
 
 from tqdm.asyncio import tqdm as async_tqdm
 
-from core.config import Config
-from core.api_call import async_llm_call, async_llm_call_with_metadata
+from benchmarks.matcher import check_answer_detailed, extract_final_answer
+from core.api_call import async_llm_call_with_metadata
 from modules.execute_module import URLRouter
 from template.prompt_template import DIRECT_ANSWER_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# 早停阈值：连续 N 次正确即提前终止
-EARLY_STOP_CONSECUTIVE = 5
+
+def prompt_hash() -> str:
+    return hashlib.sha256(DIRECT_ANSWER_PROMPT.strip().encode("utf-8")).hexdigest()
 
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
+def normalize_final_answer(text: str) -> str:
+    value = (extract_final_answer(text) or "").strip().lower()
+    value = value.replace(r"\left", "").replace(r"\right", "")
+    value = value.replace(r"\displaystyle", "").replace(r"\,", "")
+    value = value.replace("−", "-").replace(" ", "").strip("$.,;:")
+    return value
 
 
-def _env_float(name: str, default: float) -> float:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("Invalid float for %s=%r; using %.3f", name, raw, default)
-        return default
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Invalid int for %s=%r; using %d", name, raw, default)
-        return default
-
-
-def _clip01(value: float) -> float:
-    return max(0.0, min(1.0, float(value)))
-
-
-# ════════════════════════════════════════════════════════════════
-# 答案提取与校验
-# ════════════════════════════════════════════════════════════════
-
-def _sanitize_text(text: object) -> str:
-    """移除控制字符,保留可打印内容。"""
-    if text is None:
-        return ""
-    cleaned = str(text)
-    cleaned = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", "", cleaned)
-    return cleaned.strip()
-
-
-def extract_boxed(text: str) -> Optional[str]:
-    """安全提取 \\boxed{...},支持嵌套大括号与双反斜杠。"""
-    if not text:
+def normalized_answer_entropy(answers: Sequence[str], planned_trials: int) -> Optional[float]:
+    """Entropy of final-answer frequencies, normalized by log(planned_trials)."""
+    values = [normalize_final_answer(answer) or "__missing_final_answer__" for answer in answers]
+    if not values or planned_trials <= 1:
         return None
-    for pattern in (r"\boxed{", "\\boxed{"):
-        idx = text.find(pattern)
-        if idx == -1:
-            continue
-        start = idx + len(pattern)
-        depth = 1
-        for i in range(start, len(text)):
-            if text[i] == "{":
-                depth += 1
-            elif text[i] == "}":
-                depth -= 1
-                if depth == 0:
-                    raw = text[start:i].strip().strip("$")
-                    return raw.strip()
-        return None
-    return None
+    counts = Counter(values)
+    total = len(values)
+    entropy = -sum((count / total) * math.log(count / total) for count in counts.values())
+    return max(0.0, min(1.0, entropy / math.log(planned_trials)))
 
 
-def normalize_answer(text: str) -> str:
-    """规范化答案文本用于比对。"""
-    cleaned = _sanitize_text(text).lower()
-    if not cleaned:
-        return ""
-    cleaned = cleaned.replace("\\left", "").replace("\\right", "")
-    cleaned = cleaned.replace("\\displaystyle", "")
-    cleaned = cleaned.replace("\\dfrac", "\\frac").replace("\\tfrac", "\\frac")
-    cleaned = cleaned.replace("\\,", "").replace("\\ ", "")
-    cleaned = cleaned.replace("$", "")
-    cleaned = cleaned.replace("\\(", "").replace("\\)", "")
-    cleaned = cleaned.replace("\\[", "").replace("\\]", "")
-    cleaned = re.sub(r"\s+", "", cleaned)
-    cleaned = re.sub(r"^finalanswer:?", "", cleaned)
-    cleaned = re.sub(r"^answer:?", "", cleaned)
-    cleaned = cleaned.strip(".,;:!?\"'")
-    cleaned = cleaned.replace("\\", "")
-    return cleaned
+def mean_available(values: Sequence[Optional[float]]) -> Optional[float]:
+    valid = [float(value) for value in values if isinstance(value, (int, float))]
+    return sum(valid) / len(valid) if valid else None
 
-
-def check_answer_correct(generated: str, expected: str) -> Tuple[bool, Optional[str]]:
-    """校验答案是否正确。"""
-    if not generated or not expected:
-        return False, None
-    expected_norm = normalize_answer(expected)
-    if not expected_norm:
-        return False, None
-
-    boxed = extract_boxed(generated)
-    if boxed:
-        boxed_norm = normalize_answer(boxed)
-        if boxed_norm == expected_norm:
-            return True, boxed
-        if expected_norm in boxed_norm or boxed_norm in expected_norm:
-            return True, boxed
-
-    fa_match = re.search(r"Final\s*Answer:\s*(.+?)(?:\n|$)", generated, re.IGNORECASE)
-    if fa_match:
-        fa_text = fa_match.group(1).strip()
-        fa_norm = normalize_answer(fa_text)
-        if fa_norm == expected_norm or expected_norm in fa_norm or fa_norm in expected_norm:
-            return True, fa_text
-
-    gen_norm = normalize_answer(generated)
-    if gen_norm and expected_norm:
-        if expected_norm in gen_norm or gen_norm in expected_norm:
-            return True, None
-
-    return False, boxed
-
-
-# ════════════════════════════════════════════════════════════════
-# Stage 1 采样器
-# ════════════════════════════════════════════════════════════════
 
 class Stage1Sampler:
-    """K-trial 采样, 三区划分, 等分四级."""
+    """Run exactly K reproducible rollouts and preserve complete evidence."""
 
     def __init__(
         self,
@@ -166,455 +61,395 @@ class Stage1Sampler:
         model: str,
         api_key: str = "EMPTY",
         k_trials: int = 10,
+        experiment_seed: int = 42,
         temperature: float = 0.7,
+        top_p: float = 0.95,
         max_tokens: int = 4096,
         timeout: int = 600,
-        use_entropy_signal: Optional[bool] = None,
-        capability_lambda: Optional[float] = None,
-        capability_alpha: Optional[float] = None,
-        capability_beta: Optional[float] = None,
-        request_logprobs: Optional[bool] = None,
-        top_logprobs: Optional[int] = None,
-        disable_early_stop_for_entropy: Optional[bool] = None,
+        request_logprobs: bool = True,
+        top_logprobs: int = 5,
+        entropy_histogram_bins: int = 20,
+        task_batch_size: int = 1000,
+        disable_early_stop: bool = True,
+        **_legacy: Any,
     ):
-        self.urls = urls
+        self.urls = list(urls)
         self.model = model
         self.api_key = api_key
-        self.k_trials = k_trials
-        self.temperature = temperature
-        self.max_tokens = max_tokens
-        self.timeout = timeout
-        self.router = URLRouter(urls)
-        self.use_entropy_signal = (
-            _env_bool("MEMUA_STAGE1_USE_ENTROPY", True)
-            if use_entropy_signal is None else bool(use_entropy_signal)
-        )
-        self.capability_lambda = _clip01(
-            _env_float("MEMUA_CAPABILITY_LAMBDA", 0.7)
-            if capability_lambda is None else capability_lambda
-        )
-        self.capability_alpha = _clip01(
-            _env_float("MEMUA_CAPABILITY_ALPHA", 0.25)
-            if capability_alpha is None else capability_alpha
-        )
-        self.capability_beta = _clip01(
-            _env_float("MEMUA_CAPABILITY_BETA", 0.75)
-            if capability_beta is None else capability_beta
-        )
-        self.request_logprobs = (
-            _env_bool("MEMUA_STAGE1_LOGPROBS", True)
-            if request_logprobs is None else bool(request_logprobs)
-        )
-        self.top_logprobs = max(
-            1,
-            _env_int("MEMUA_STAGE1_TOP_LOGPROBS", 5)
-            if top_logprobs is None else int(top_logprobs),
-        )
-        self.disable_early_stop_for_entropy = (
-            _env_bool("MEMUA_STAGE1_DISABLE_EARLY_STOP_FOR_ENTROPY", True)
-            if disable_early_stop_for_entropy is None else bool(disable_early_stop_for_entropy)
+        self.k_trials = int(k_trials)
+        self.experiment_seed = int(experiment_seed)
+        self.temperature = float(temperature)
+        self.top_p = float(top_p)
+        self.max_tokens = int(max_tokens)
+        self.timeout = int(timeout)
+        self.request_logprobs = bool(request_logprobs)
+        self.top_logprobs = int(top_logprobs)
+        self.entropy_histogram_bins = int(entropy_histogram_bins)
+        self.task_batch_size = max(1, int(task_batch_size))
+        self.disable_early_stop = bool(disable_early_stop)
+        self.router = URLRouter(self.urls)
+
+    @property
+    def rollout_seeds(self) -> List[int]:
+        return [self.experiment_seed + index for index in range(self.k_trials)]
+
+    @staticmethod
+    def level_from_correct_count(correct_count: int, planned_trials: int = 10) -> int:
+        if planned_trials <= 0 or correct_count <= 0 or correct_count >= planned_trials:
+            return 0
+        rate = correct_count / planned_trials
+        if rate >= 0.75:
+            return 1
+        if rate >= 0.50:
+            return 2
+        if rate >= 0.25:
+            return 3
+        return 4
+
+    @classmethod
+    def level_from_result(cls, result: Dict[str, Any]) -> int:
+        return cls.level_from_correct_count(
+            int(result.get("correct_count") or 0),
+            int(result.get("planned_trials") or 10),
         )
 
-    async def _single_inference(self, question: str) -> str:
+    async def _single_inference_with_metadata(self, question: str, seed: int) -> Dict[str, Any]:
         prompt = DIRECT_ANSWER_PROMPT.format(question=question)
+        attempted: List[str] = []
         for _ in range(max(1, len(self.urls))):
             url = self.router.next()
+            if url in attempted and len(attempted) < len(self.urls):
+                continue
+            attempted.append(url)
             try:
-                response = await async_llm_call(
-                    prompt=prompt, model=self.model, url=url,
-                    api_key=self.api_key, temperature=self.temperature,
-                    max_tokens=self.max_tokens, timeout=self.timeout,
-                )
-                if response:
-                    self.router.report_success(url)
-                    return response
-                self.router.report_failure(url, "empty response")
-            except Exception as e:
-                self.router.report_failure(url, str(e))
-        return ""
-
-    async def _single_inference_with_metadata(self, question: str) -> Dict[str, Any]:
-        prompt = DIRECT_ANSWER_PROMPT.format(question=question)
-        for _ in range(max(1, len(self.urls))):
-            url = self.router.next()
-            try:
-                response = await async_llm_call_with_metadata(
+                result = await async_llm_call_with_metadata(
                     prompt=prompt,
                     model=self.model,
                     url=url,
                     api_key=self.api_key,
                     temperature=self.temperature,
+                    top_p=self.top_p,
                     max_tokens=self.max_tokens,
+                    retries=1,
                     timeout=self.timeout,
                     request_logprobs=self.request_logprobs,
                     top_logprobs=self.top_logprobs,
+                    entropy_histogram_bins=self.entropy_histogram_bins,
                     include_raw=False,
+                    seed=seed,
                 )
-                if response.get("text"):
+                if result.get("text"):
                     self.router.report_success(url)
-                    return response
+                    result["endpoint"] = url
+                    result["transport_status"] = "success"
+                    return result
                 self.router.report_failure(url, "empty response")
-            except Exception as e:
-                self.router.report_failure(url, str(e))
+            except Exception as exc:
+                self.router.report_failure(url, str(exc))
         return {
             "text": "",
-            "entropy": {
-                "available": False,
-                "normalized_entropy": 1.0,
-                "trajectory_entropy": 1.0,
-                "token_count": 0,
-                "entropy_token_count": 0,
-                "avg_neg_logprob": None,
-                "method": "request_failed_default_max_entropy",
-            },
+            "endpoint": attempted[-1] if attempted else "",
+            "transport_status": "infrastructure_failed",
+            "entropy": {"available": False, "normalized_entropy": None, "method": "unavailable"},
         }
 
-    @staticmethod
-    def sr_zone(correct_count: int, actual_trials: int, early_stopped: bool = False) -> str:
-        if actual_trials <= 0:
-            return "no_data"
-        if early_stopped or correct_count == actual_trials:
-            return "master"
-        if correct_count == 0:
-            return "panic"
-        return "learning"
-
-    @staticmethod
-    def capability_zone(score: float, alpha: float = 0.25, beta: float = 0.75) -> str:
-        if score < alpha:
-            return "panic"
-        if score > beta:
-            return "master"
-        return "learning"
-
-    @staticmethod
-    def level_from_score(score: float) -> int:
-        if score >= 0.75:
-            return 1
-        if score >= 0.50:
-            return 2
-        if score >= 0.25:
-            return 3
-        if score > 0:
-            return 4
-        return 0
-
-    @classmethod
-    def level_from_result(cls, result: Dict[str, Any]) -> int:
-        score = result.get("capability_score", result.get("sr", 0.0))
-        try:
-            return cls.level_from_score(float(score))
-        except (TypeError, ValueError):
-            return 0
-
     def finalize_result(self, result: Dict[str, Any]) -> Dict[str, Any]:
-        actual_trials = int(result.get("actual_trials") or 0)
-        correct_count = int(result.get("correct_count") or 0)
-        planned_trials = int(result.get("planned_trials") or self.k_trials or actual_trials or 0)
-        denominator = planned_trials if planned_trials > 0 else actual_trials
-
-        sr_actual = correct_count / actual_trials if actual_trials > 0 else 0.0
-        sr_fixed_k = correct_count / denominator if denominator > 0 else 0.0
-        result["success_rate_actual"] = _clip01(sr_actual)
-        result["success_rate_fixed_k"] = _clip01(sr_fixed_k)
-        result["sr"] = _clip01(sr_fixed_k if self.use_entropy_signal else sr_actual)
-
-        records = result.get("trial_records") or []
-        entropies = []
-        available_count = 0
-        for record in records:
-            entropy_value = record.get("normalized_entropy", record.get("trajectory_entropy", 1.0))
-            try:
-                entropies.append(_clip01(float(entropy_value)))
-            except (TypeError, ValueError):
-                entropies.append(1.0)
-            if record.get("entropy_available"):
-                available_count += 1
-
-        avg_entropy = sum(entropies) / len(entropies) if entropies else 1.0
-        confidence_score = 1.0 - avg_entropy
-        capability_score = (
-            self.capability_lambda * result["success_rate_fixed_k"]
-            + (1.0 - self.capability_lambda) * confidence_score
+        records = list(result.get("trial_records") or [])
+        correct_count = sum(record.get("is_correct") is True for record in records)
+        wrong_count = sum(record.get("is_correct") is False for record in records)
+        successful = [record for record in records if record.get("transport_status") == "success"]
+        planned = int(result.get("planned_trials") or self.k_trials)
+        rate = correct_count / planned if planned else 0.0
+        token_values = [record.get("entropy", {}).get("normalized_entropy") for record in successful]
+        correct_values = [
+            record.get("entropy", {}).get("normalized_entropy")
+            for record in successful if record.get("is_correct") is True
+        ]
+        wrong_values = [
+            record.get("entropy", {}).get("normalized_entropy")
+            for record in successful if record.get("is_correct") is False
+        ]
+        token_mean = mean_available(token_values)
+        correct_mean = mean_available(correct_values)
+        wrong_mean = mean_available(wrong_values)
+        available = sum(isinstance(value, (int, float)) for value in token_values)
+        level = self.level_from_correct_count(correct_count, planned)
+        complete = len(successful) == planned
+        zone = (
+            "incomplete" if not complete else
+            "master" if correct_count == planned else
+            "panic" if correct_count == 0 else "learning"
         )
-
-        result["avg_entropy"] = _clip01(avg_entropy)
-        result["normalized_entropy"] = result["avg_entropy"]
-        result["entropy_available_trials"] = available_count
-        result["confidence_score"] = _clip01(confidence_score)
-        result["capability_score"] = _clip01(capability_score)
-        result["sr_zone"] = self.sr_zone(
-            correct_count,
-            actual_trials,
-            bool(result.get("early_stopped")),
-        )
-        result["capability_zone"] = self.capability_zone(
-            result["capability_score"],
-            self.capability_alpha,
-            self.capability_beta,
-        )
-        result["zone"] = result["capability_zone"] if self.use_entropy_signal else result["sr_zone"]
-        result["assigned_level"] = self.level_from_result(result)
+        if not complete:
+            level = 0
+        result.update({
+            "actual_trials": len(records),
+            "successful_trials": len(successful),
+            "correct_count": correct_count,
+            "wrong_count": wrong_count,
+            "success_rate": rate,
+            "sr": rate,
+            "zone": zone,
+            "assigned_level": level,
+            "correct_trajectories": [r["response"] for r in successful if r.get("is_correct")],
+            "wrong_trajectories": [r["response"] for r in successful if r.get("is_correct") is False],
+            "capability_signal": {
+                "primary_metric": "success_rate",
+                "correct_count": correct_count,
+                "wrong_count": wrong_count,
+                "success_rate": rate,
+                "assigned_level": f"level{level}" if level else zone,
+                "entropy": {
+                    "available": available > 0,
+                    "coverage": available / len(successful) if successful else 0.0,
+                    "h_token": token_mean,
+                    "h_answer": normalized_answer_entropy(
+                        [record.get("response", "") for record in successful], planned
+                    ),
+                    "h_gap": (
+                        wrong_mean - correct_mean
+                        if wrong_mean is not None and correct_mean is not None else None
+                    ),
+                    "correct_mean": correct_mean,
+                    "wrong_mean": wrong_mean,
+                    "method": "top_logprobs_normalized_entropy",
+                },
+            },
+        })
         return result
 
-    async def sample_one_task(self, task: Dict[str, Any], task_idx: int) -> Dict[str, Any]:
-        """对单个任务执行 K-trial 采样（含早停）。
-
-        Returns 包含 zone / correct_count / sr / 全部轨迹.
-        """
-        question = task.get("question", "")
-        expected = task.get("answer", "")
-
+    async def sample_one_task(
+        self,
+        task: Dict[str, Any],
+        task_idx: int,
+        existing_records: Optional[Sequence[Dict[str, Any]]] = None,
+        checkpoint_callback: Optional[Callable[[int, Dict[str, Any], List[Dict[str, Any]]], Awaitable[None]]] = None,
+    ) -> Dict[str, Any]:
+        question = str(task.get("question") or "").strip()
+        expected = str(task.get("answer") or "").strip()
+        question_id = str(task.get("id") or task.get("question_id") or task_idx)
+        if not question or not expected or not str(task.get("difficulty_level") or "").strip():
+            return {
+                "schema_version": "stage1.1", "idx": task_idx, "question_id": question_id,
+                "question": question, "expected_answer": expected,
+                "orig_level": task.get("difficulty_level", ""), "planned_trials": self.k_trials,
+                "trial_records": [], "actual_trials": 0, "successful_trials": 0,
+                "correct_count": 0, "wrong_count": 0, "success_rate": 0.0, "sr": 0.0,
+                "zone": "invalid_input", "assigned_level": 0,
+                "correct_trajectories": [], "wrong_trajectories": [],
+                "sampling_config": {},
+                "capability_signal": {
+                    "primary_metric": "success_rate", "correct_count": 0, "wrong_count": 0,
+                    "success_rate": 0.0, "assigned_level": "invalid_input",
+                    "entropy": {"available": False, "coverage": 0.0, "h_token": None,
+                                "h_answer": None, "h_gap": None, "correct_mean": None,
+                                "wrong_mean": None, "method": "unavailable"},
+                },
+            }
+        records = [dict(item) for item in (existing_records or []) if isinstance(item, dict)]
+        completed_seeds = {
+            int(item["seed"]) for item in records
+            if item.get("seed") is not None and item.get("transport_status") == "success"
+        }
+        for trial, seed in enumerate(self.rollout_seeds, start=1):
+            if seed in completed_seeds:
+                continue
+            metadata = await self._single_inference_with_metadata(question, seed)
+            response = str(metadata.get("text") or "")
+            extracted = extract_final_answer(response)
+            transport_ok = metadata.get("transport_status") == "success"
+            match = (
+                check_answer_detailed(response, expected)
+                if transport_ok else
+                {"correct": False, "status": "not_run", "method": "none", "reason": "transport_failed"}
+            )
+            record = {
+                "rollout_id": hashlib.sha256(f"{question_id}:{seed}".encode()).hexdigest()[:20],
+                "trial": trial,
+                "seed": seed,
+                "response": response,
+                "final_answer": extracted,
+                "is_correct": bool(match["correct"]) if transport_ok else None,
+                "match_status": match.get("status", "not_matched"),
+                "match_method": match.get("method", "none"),
+                "match_reason": match.get("reason", ""),
+                "model": self.model,
+                "prompt_version": "stage1_direct_v1",
+                "prompt_hash": prompt_hash(),
+                "endpoint": metadata.get("endpoint", ""),
+                "transport_status": metadata.get("transport_status", "infrastructure_failed"),
+                "duration_sec": metadata.get("duration_sec"),
+                "entropy": metadata.get("entropy") or {"available": False, "normalized_entropy": None},
+            }
+            records = [item for item in records if int(item.get("seed", -1)) != seed]
+            records.append(record)
+            records.sort(key=lambda item: int(item.get("seed", -1)))
+            if checkpoint_callback is not None:
+                await checkpoint_callback(task_idx, record, records)
         result = {
+            "schema_version": "stage1.1",
             "idx": task_idx,
+            "question_id": question_id,
             "question": question,
             "expected_answer": expected,
             "orig_level": task.get("difficulty_level", ""),
-            "all_answers": [],
-            "correct_trajectories": [],
-            "wrong_trajectories": [],
-            "correct_count": 0,
-            "wrong_count": 0,
-            "sr": 0.0,
-            "zone": "panic",
-            "trial_records": [],
             "planned_trials": self.k_trials,
-            "early_stopped": False,
-            "actual_trials": 0,
+            "trial_records": records,
+            "sampling_config": {
+                "model": self.model,
+                "prompt_version": "stage1_direct_v1",
+                "prompt_hash": prompt_hash(),
+                "k_trials": self.k_trials,
+                "rollout_seeds": self.rollout_seeds,
+                "experiment_seed": self.experiment_seed,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_logprobs": self.top_logprobs,
+                "entropy_histogram_bins": self.entropy_histogram_bins,
+                "max_tokens": self.max_tokens,
+                "early_stop": False,
+            },
         }
-
-        if not question or not expected:
-            result["zone"] = "no_data"
-            result["sr_zone"] = "no_data"
-            result["capability_zone"] = "no_data"
-            return result
-
-        consecutive_correct = 0
-
-        for trial in range(self.k_trials):
-            entropy = {
-                "available": False,
-                "normalized_entropy": 1.0,
-                "trajectory_entropy": 1.0,
-                "token_count": 0,
-                "entropy_token_count": 0,
-                "avg_neg_logprob": None,
-                "method": "disabled_default_max_entropy",
-            }
-            if self.use_entropy_signal:
-                metadata = await self._single_inference_with_metadata(question)
-                response = metadata.get("text", "")
-                entropy = metadata.get("entropy") or entropy
-            else:
-                response = await self._single_inference(question)
-            if not response:
-                response = "[EMPTY_RESPONSE]"
-
-            result["actual_trials"] = trial + 1
-            is_correct, extracted = check_answer_correct(response, expected)
-            result["all_answers"].append(response)
-            result["trial_records"].append({
-                "trial": trial + 1,
-                "response": response,
-                "is_correct": bool(is_correct),
-                "extracted_answer": extracted,
-                "normalized_entropy": entropy.get("normalized_entropy", 1.0),
-                "trajectory_entropy": entropy.get("trajectory_entropy", entropy.get("normalized_entropy", 1.0)),
-                "entropy_available": bool(entropy.get("available")),
-                "entropy_method": entropy.get("method", "unknown"),
-                "token_count": entropy.get("token_count", 0),
-                "entropy_token_count": entropy.get("entropy_token_count", 0),
-                "avg_neg_logprob": entropy.get("avg_neg_logprob"),
-            })
-
-            if is_correct:
-                result["correct_trajectories"].append(response)
-                result["correct_count"] += 1
-                consecutive_correct += 1
-            else:
-                result["wrong_trajectories"].append(response)
-                result["wrong_count"] += 1
-                consecutive_correct = 0
-
-            # 早停: 连续 5 次正确 → 认定为 Master
-            early_stop_enabled = not (self.use_entropy_signal and self.disable_early_stop_for_entropy)
-            if early_stop_enabled and consecutive_correct >= EARLY_STOP_CONSECUTIVE:
-                result["early_stopped"] = True
-                break
-
         return self.finalize_result(result)
 
     @staticmethod
-    def _load_checkpoint(checkpoint_path: Optional[str]) -> List[Dict[str, Any]]:
-        if not checkpoint_path:
-            return []
-        ckpt = Path(checkpoint_path)
-        if not ckpt.exists():
-            return []
+    def _load_checkpoint(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
+        if not path or not Path(path).exists():
+            return {}
         try:
-            data = json.loads(ckpt.read_text(encoding="utf-8"))
-            return data.get("results", [])
+            grouped: Dict[str, Dict[int, Dict[str, Any]]] = {}
+            for line in Path(path).read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                index = str(payload["task_index"])
+                record = payload["record"]
+                grouped.setdefault(index, {})[int(record["seed"])] = record
+            return {
+                index: [records[seed] for seed in sorted(records)]
+                for index, records in grouped.items()
+            }
         except Exception:
-            return []
+            return {}
 
     async def sample_all(
-        self, tasks: Sequence[Dict[str, Any]], concurrency: int = 10,
+        self,
+        tasks: Sequence[Dict[str, Any]],
+        concurrency: int = 16,
         checkpoint_path: Optional[str] = None,
         collect_all_samples: bool = False,
     ) -> Dict[str, Any]:
-        """全量采样并划分三区 + 等分四级.
-
-        Args:
-            tasks: 待采样任务列表
-            concurrency: 并发数
-            checkpoint_path: 增量 checkpoint 路径
-            collect_all_samples: True = 收集所有 zone (No Learning Zone 消融).
-                False = 只收集 learning-zone (默认).
-        """
-        semaphore = asyncio.Semaphore(concurrency)
-
-        # ── 断点续跑：加载已完成 ──
-        cached_results = self._load_checkpoint(checkpoint_path)
-        completed_ids: set = {r.get("idx") for r in cached_results if r.get("idx") is not None}
-        pending = [(i, t) for i, t in enumerate(tasks) if i not in completed_ids]
-
-        if completed_ids:
-            logger.info("Checkpoint: %d 已完成, %d 待处理", len(completed_ids), len(pending))
-
-        async def sample_one(task: Dict, idx: int) -> Dict:
-            async with semaphore:
-                return await self.sample_one_task(task, idx)
-
-        logger.info(
-            "Stage 1.1: K-trial 采样 (K=%d, temp=%.1f, early_stop=%d, concurrency=%d, total=%d, skip=%d)",
-            self.k_trials, self.temperature, EARLY_STOP_CONSECUTIVE, concurrency,
-            len(tasks), len(completed_ids),
-        )
-
-        # 新跑的结果（内存中），与 cached_results 合并写入 checkpoint
-        new_results: List[Dict] = []
+        del collect_all_samples  # all zones are always retained in stage1.1
+        partial = self._load_checkpoint(checkpoint_path)
+        results: Dict[int, Dict[str, Any]] = {}
         lock = asyncio.Lock()
+        semaphore = asyncio.Semaphore(max(1, int(concurrency)))
 
-        async def run_and_checkpoint(idx: int, task: Dict) -> Dict:
-            r = await sample_one(task, idx)
+        async def save_partial(index: int, latest: Dict[str, Any], records: List[Dict[str, Any]]) -> None:
+            if not checkpoint_path:
+                return
             async with lock:
-                new_results.append(r)
-                if checkpoint_path:
-                    all_r = sorted(cached_results + new_results, key=lambda x: x.get("idx", -1))
-                    ckpt = Path(checkpoint_path)
-                    ckpt.parent.mkdir(parents=True, exist_ok=True)
-                    tmp = ckpt.with_suffix(".tmp")
-                    payload = {"checkpoint": True, "results": all_r}
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(payload, f, ensure_ascii=False, indent=2)
-                    tmp.replace(ckpt)
-            return r
+                target = Path(checkpoint_path)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                partial[str(index)] = records
+                with open(target, "a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({"task_index": index, "record": latest}, ensure_ascii=False) + "\n")
+                if latest.get("match_status") in {"symbolic_skipped", "symbolic_timeout"}:
+                    audit_dir = target.parent.parent / "analysis"
+                    audit_dir.mkdir(parents=True, exist_ok=True)
+                    prefix = target.name.split("_unified_sampling_results", 1)[0]
+                    audit_path = audit_dir / f"{prefix}_matcher_skipped.jsonl"
+                    with open(audit_path, "a", encoding="utf-8") as audit_handle:
+                        audit_handle.write(json.dumps({
+                            "task_index": index,
+                            "seed": latest.get("seed"),
+                            "final_answer": latest.get("final_answer"),
+                            "match_status": latest.get("match_status"),
+                            "match_method": latest.get("match_method"),
+                            "match_reason": latest.get("match_reason"),
+                        }, ensure_ascii=False) + "\n")
 
-        coros = [run_and_checkpoint(i, t) for i, t in pending]
-        for coro in async_tqdm(asyncio.as_completed(coros), total=len(coros), desc="K-trial Sampling"):
-            await coro
+        async def sample(index: int, task: Dict[str, Any]) -> Dict[str, Any]:
+            async with semaphore:
+                return await self.sample_one_task(task, index, partial.get(str(index), []), save_partial)
 
-        # 合并所有结果
-        results = sorted(cached_results + new_results, key=lambda r: r.get("idx", -1))
+        # Process bounded windows with a fixed worker pool.  Creating one
+        # coroutine per dataset row caused needless scheduler/memory pressure
+        # on full 6k-question runs.
+        progress = async_tqdm(total=len(tasks), desc="Stage 1 sampling")
+        try:
+            for batch_start in range(0, len(tasks), self.task_batch_size):
+                batch_end = min(len(tasks), batch_start + self.task_batch_size)
+                queue: asyncio.Queue[tuple[int, Dict[str, Any]]] = asyncio.Queue()
+                for index in range(batch_start, batch_end):
+                    queue.put_nowait((index, tasks[index]))
 
-        # ── 分区统计 ──
-        master = [r for r in results if r.get("zone") == "master"]
-        learning = [r for r in results if r.get("zone") == "learning"]
-        panic = [r for r in results if r.get("zone") == "panic"]
-        no_data = [r for r in results if r.get("zone") == "no_data"]
-        early_stopped = [r for r in results if r.get("early_stopped")]
+                async def worker() -> None:
+                    while True:
+                        try:
+                            index, task = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            return
+                        try:
+                            result = await sample(index, task)
+                            results[int(result["idx"])] = result
+                            progress.update(1)
+                        finally:
+                            queue.task_done()
 
-        # ── 按论文 SR 阈值分四级 ──
-        # Level 1: SR >= 0.75  (近掌握, 偶尔失误可诊断)
-        # Level 2: 0.50 <= SR < 0.75
-        # Level 3: 0.25 <= SR < 0.50
-        # Level 4: SR < 0.25   (近恐慌, 信噪比低)
-        level_data: Dict[str, List[Dict]] = {"1": [], "2": [], "3": [], "4": []}
-
-        source = [r for r in results if r.get("zone") != "no_data"] if collect_all_samples else learning
-        if collect_all_samples:
-            logger.info("No Learning Zone ablation: collecting %d samples (all zones except no_data)", len(source))
-
-        for r in source:
-            level = self.level_from_result(r)
-            if level <= 0:
-                continue
-            r["assigned_level"] = level
-            level_data[str(level)].append(r)
-
-        for lv in ("1", "2", "3", "4"):
-            items = level_data[lv]
-            if items:
-                logger.info(
-                    "  Level %s: %d samples, correct_count [%d, %d]",
-                    lv, len(items),
-                    min(r["correct_count"] for r in items),
-                    max(r["correct_count"] for r in items),
-                )
-
-        summary = {
-            "total": len(results),
-            "master_zone": len(master),
-            "learning_zone": len(learning),
-            "panic_zone": len(panic),
-            "no_data": len(no_data),
-            "early_stopped": len(early_stopped),
-            "k_trials": self.k_trials,
-            "temperature": self.temperature,
-            "capability_signal_enabled": self.use_entropy_signal,
-            "capability_lambda": self.capability_lambda,
-            "capability_alpha": self.capability_alpha,
-            "capability_beta": self.capability_beta,
-            "entropy_available_trials": sum(int(r.get("entropy_available_trials") or 0) for r in results),
-            "sr_zone_counts": {
-                "master": sum(1 for r in results if r.get("sr_zone") == "master"),
-                "learning": sum(1 for r in results if r.get("sr_zone") == "learning"),
-                "panic": sum(1 for r in results if r.get("sr_zone") == "panic"),
-                "no_data": sum(1 for r in results if r.get("sr_zone") == "no_data"),
-            },
-            "capability_zone_counts": {
-                "master": sum(1 for r in results if r.get("capability_zone") == "master"),
-                "learning": sum(1 for r in results if r.get("capability_zone") == "learning"),
-                "panic": sum(1 for r in results if r.get("capability_zone") == "panic"),
-                "no_data": sum(1 for r in results if r.get("capability_zone") == "no_data"),
-            },
-            "levels": {lv: len(level_data[lv]) for lv in ("1", "2", "3", "4")},
-        }
-
-        logger.info(
-            "Stage 1.1 完成: total=%d | master=%d | learning=%d | panic=%d | early_stop=%d",
-            summary["total"], summary["master_zone"], summary["learning_zone"],
-            summary["panic_zone"], summary["early_stopped"],
-        )
-        logger.info(
-            "  Level 分配: L1=%d L2=%d L3=%d L4=%d",
-            summary["levels"]["1"], summary["levels"]["2"],
-            summary["levels"]["3"], summary["levels"]["4"],
-        )
-
+                workers = [
+                    asyncio.create_task(worker())
+                    for _ in range(min(max(1, int(concurrency)), batch_end - batch_start))
+                ]
+                await asyncio.gather(*workers)
+        finally:
+            progress.close()
+        ordered = [results[index] for index in sorted(results)]
+        levels = {str(level): [] for level in range(1, 5)}
+        for result in ordered:
+            level = int(result.get("assigned_level") or 0)
+            if level:
+                levels[str(level)].append(result)
         return {
+            "schema_version": "stage1.1",
             "config": {
                 "k_trials": self.k_trials,
+                "experiment_seed": self.experiment_seed,
+                "rollout_seeds": self.rollout_seeds,
                 "temperature": self.temperature,
-                "early_stop_consecutive": EARLY_STOP_CONSECUTIVE,
-                "use_entropy_signal": self.use_entropy_signal,
-                "request_logprobs": self.request_logprobs,
+                "top_p": self.top_p,
                 "top_logprobs": self.top_logprobs,
-                "disable_early_stop_for_entropy": self.disable_early_stop_for_entropy,
-                "capability_formula": "S = lambda * F + (1 - lambda) * (1 - H)",
-                "capability_lambda": self.capability_lambda,
-                "capability_alpha": self.capability_alpha,
-                "capability_beta": self.capability_beta,
+                "task_batch_size": self.task_batch_size,
+                "early_stop": False,
+                "level_policy": "accuracy_only",
+                "entropy_role": "within_level_ranking_only",
             },
-            "results": results,
-            "summary": summary,
-            "level_data": level_data,
+            "results": ordered,
+            "level_data": levels,
+            "summary": {
+                "total": len(ordered),
+                "master_zone": sum(item["zone"] == "master" for item in ordered),
+                "learning_zone": sum(item["zone"] == "learning" for item in ordered),
+                "panic_zone": sum(item["zone"] == "panic" for item in ordered),
+                "incomplete": sum(
+                    item["zone"] != "invalid_input" and item["successful_trials"] != self.k_trials
+                    for item in ordered
+                ),
+                "invalid_input": sum(item["zone"] == "invalid_input" for item in ordered),
+                "zone_policy": {
+                    "master": "correct_count == planned_trials",
+                    "learning": "0 < correct_count < planned_trials",
+                    "panic": "correct_count == 0",
+                    "incomplete": "successful_trials < planned_trials",
+                },
+                "levels": {key: len(value) for key, value in levels.items()},
+            },
         }
 
     @staticmethod
     def save(data: Dict[str, Any], output_path: Path) -> Path:
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        logger.info("采样结果已保存: %s", output_path)
+        temporary = output_path.with_suffix(output_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(output_path)
         return output_path

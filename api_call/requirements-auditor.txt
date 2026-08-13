@@ -1,0 +1,4 @@
+# Qwen3.5 currently requires vLLM from the current/nightly line.
+# Install this in a fresh serving environment, separately from requirements.txt.
+--extra-index-url https://wheels.vllm.ai/nightly
+vllm

@@ -1,37 +1,8 @@
-"""
-core/agent_pipeline.py — AgentPipeline 统一编排
+"""Weak-model runtime used by Stage 1 and legacy in-process Stage 3 helpers.
 
-三阶段 Agent 流水线:
-
-  ┌─── Stage 1: 学习区挖掘 ────────────────────────────────────┐
-  │  execute.sample_unstable()    # 多次推理，发现 learning-zone  │
-  │  execute.mine_hard_negatives()# 挖掘困难负样本                │
-  │  plan.extract_semantics()     # 三维语义特征提取              │
-  │  plan.diff_analysis()         # 正确/错误路径差异分析          │
-  │  plan.generate_principles()   # 可复用经验生成                │
-  │  plan.crucible_test()         # 坩埚验证                     │
-  └───────────────────────────────────────────────────────────────┘
-                                  ↓
-  ┌─── Stage 2: 记忆构建 ─────────────────────────────────────────┐
-  │  memory.ingest()              # 经验入库 + 去重                │
-  │  memory.build_indices()       # FAISS 三维向量索引             │
-  │  memory.save() + snapshot()   # 持久化 + 快照                 │
-  └───────────────────────────────────────────────────────────────┘
-                                  ↓
-  ┌─── Stage 3: 检索增强评估 ─────────────────────────────────────┐
-  │  plan.extract_semantics()     # 提取测试题语义特征             │
-  │  memory.retrieve()            # 三维门控检索匹配经验           │
-  │  execute.answer_guided()      # 经验引导答题                  │
-  │  execute.check_answer()       # 答案校验                     │
-  └───────────────────────────────────────────────────────────────┘
-
-使用方式:
-  # 编程式
-  pipeline = AgentPipeline(config, ports=[8000])
-  await pipeline.run_full_curriculum(levels=[1,2,3,4])
-
-  # CLI
-  python -m core.agent_pipeline --levels 1 2 --ports 8000
+The public controller is the repository-root ``pipeline.py``. Stage 2 is not
+implemented here: its independent Generator/Auditor/Store orchestration lives
+in ``modules.stage2.factory`` so it cannot silently reuse the weak Solver.
 """
 import asyncio
 import json
@@ -60,10 +31,8 @@ from modules.execute_module import (
     filter_healthy_urls,
 )
 from modules.stage1_sampler import Stage1Sampler
-from modules.stage1_miner import Stage1Miner
-from modules.stage2_repair import RecursiveRepairProtocol
-from modules.dsd_module import DSDRegistry
-from output_paths import (
+from modules.stage1_miner import Stage1Miner, save_rankings_and_manifests, write_analysis_csv
+from utils.output_paths import (
     stage2_memory_file,
     stage2_summary_file,
     stage1_learning_packets_file,
@@ -95,57 +64,6 @@ def _build_stage3_retry_prompt(question: str, principle_text: str, previous_resp
     )
     sections.append(f"[Previous Attempt]\n{previous_response}")
     return "\n\n".join(sections)
-
-
-def _principle_text_for_memory(candidate: Dict[str, Any]) -> str:
-    text = str(candidate.get("principle_text", "") or candidate.get("principle", "") or candidate.get("action_guidance", "") or "").strip()
-    if text:
-        return text
-    parts = [str(candidate.get(key, "")).strip() for key in ("trigger_condition", "action_guidance", "scope")]
-    return " ".join(part for part in parts if part)
-
-
-def _normalize_principle_compare_text(text: str) -> str:
-    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
-    normalized = re.sub(r"[^a-z0-9\s]", "", normalized)
-    return normalized.strip()
-
-
-def _candidate_rank_key(candidate: Dict[str, Any]) -> tuple[float, float, int]:
-    quality = candidate.get("quality_metrics", {}) if isinstance(candidate.get("quality_metrics", {}), dict) else {}
-    rank_score = float(candidate.get("rank_score", quality.get("rank_score", 0.0)) or 0.0)
-    neighbor_ratio = float(candidate.get("neighbor_pass_ratio", quality.get("overall_pass_ratio", 0.0)) or 0.0)
-    principle_len = len(_principle_text_for_memory(candidate))
-    return (rank_score, neighbor_ratio, principle_len)
-
-
-def _fast_reconcile_principles(new_principle: str, existing_principle: str) -> Optional[Dict[str, str]]:
-    new_norm = _normalize_principle_compare_text(new_principle)
-    existing_norm = _normalize_principle_compare_text(existing_principle)
-    if not new_norm or not existing_norm:
-        return None
-    if new_norm == existing_norm:
-        return {
-            "status": "heuristic",
-            "decision": "merge_with_existing",
-            "merged_principle": existing_principle if len(existing_principle) >= len(new_principle) else new_principle,
-            "reason": "exact_text_match",
-        }
-    if new_norm in existing_norm:
-        return {
-            "status": "heuristic",
-            "decision": "merge_with_existing",
-            "merged_principle": existing_principle,
-            "reason": "new_is_subspan_of_existing",
-        }
-    if existing_norm in new_norm:
-        return {
-            "status": "heuristic",
-            "decision": "replace_existing",
-            "merged_principle": new_principle,
-            "reason": "new_subsumes_existing",
-        }
-    return None
 
 
 def _normalize_level_tag(value: Any) -> str:
@@ -205,10 +123,10 @@ def _bootstrap_stage3_progress_from_previous_round(
         return progress_state
 
     previous_dataset = None
-    if dataset and re.search(r"dpo_level\d+", dataset):
-        previous_dataset = re.sub(r"dpo_level(\d+)", lambda m: f"dpo_level{int(m.group(1)) - 1}", dataset)
+    if dataset and re.search(r"level\d+", dataset):
+        previous_dataset = re.sub(r"level(\d+)", lambda m: f"level{int(m.group(1)) - 1}", dataset)
     if not previous_dataset:
-        previous_dataset = f"dpo_level{int(eval_level) - 1}"
+        previous_dataset = f"level{int(eval_level) - 1}"
 
     current_items_by_key = {_test_item_key(item): item for item in test_data}
     candidate_paths: List[Path] = []
@@ -496,9 +414,16 @@ class AgentPipeline:
         self,
         dataset_path: Optional[str] = None,
         concurrency: int = 10,
-        diff_concurrency: int = 10,
         k_trials: int = 10,
+        experiment_seed: int = 42,
         temperature: float = 0.7,
+        top_p: float = 0.95,
+        top_logprobs: int = 5,
+        entropy_histogram_bins: int = 20,
+        max_tokens: int = 4096,
+        task_batch_size: int = 1000,
+        expected_dataset_sha256: str = "",
+        expected_dataset_size: int = 6000,
         skip_sampling: bool = False,
         backbone: str = "",
         urls_override: Optional[List[str]] = None,
@@ -506,7 +431,7 @@ class AgentPipeline:
         resume: bool = False,
         collect_all_samples: bool = False,
     ) -> Optional[Path]:
-        """Stage 1: 全量采样 → 三区划分 → 等分四级 → mining + diff + 打包.
+        """Stage 1: complete sampling -> accuracy levels -> entropy rankings.
 
         Args:
             backbone: 模型标识,用于输出路径分离 (e.g. "qwen", "llama")
@@ -526,28 +451,65 @@ class AgentPipeline:
                 Path(self.config.paths.output_dir).parent / "data" / "deepscaler_merged_6000.json"
             )
             if not Path(src).exists():
-                logger.error("Unified dataset not found: %s", src)
-                return None
+                raise FileNotFoundError(f"Unified dataset not found: {src}")
+            dataset_sha256 = hashlib.sha256(Path(src).read_bytes()).hexdigest()
+            if expected_dataset_sha256 and dataset_sha256 != expected_dataset_sha256:
+                raise ValueError(
+                    f"Dataset SHA-256 mismatch: expected {expected_dataset_sha256}, got {dataset_sha256}"
+                )
             tasks = load_json(src)
             if not isinstance(tasks, list) or not tasks:
-                logger.error("Dataset is empty: %s", src)
-                return None
+                raise ValueError(f"Dataset is empty: {src}")
+            if expected_dataset_size and len(tasks) != int(expected_dataset_size):
+                raise ValueError(f"Expected {expected_dataset_size} tasks, found {len(tasks)}")
+            missing = [index for index, item in enumerate(tasks) if not isinstance(item, dict) or any(
+                not str(item.get(field, "")).strip() for field in ("question", "answer", "difficulty_level")
+            )]
+            if missing:
+                logger.warning(
+                    "Retaining %d invalid input record(s) outside Master/Learning/Panic: %s",
+                    len(missing), missing[:10],
+                )
             logger.info("Stage 1 [%s]: loaded %d tasks", tag, len(tasks))
 
             # ── Step 1.1: 采样 ──
             sampling_path = stage1_unified_sampling_file(output_root, backbone)
             sampling_ckpt = str(sampling_path).replace(".json", ".checkpoint.json")
-            if skip_sampling and sampling_path.exists():
+            if skip_sampling:
+                if not sampling_path.exists():
+                    raise FileNotFoundError(
+                        f"--skip-sampling was requested, but no Stage 1 sampling artifact exists: "
+                        f"{sampling_path}"
+                    )
                 logger.info("[Stage 1.1 %s skipped] using existing: %s", tag, sampling_path)
                 sampling_data = load_json(str(sampling_path))
             else:
                 # 已有完整文件直接复用（total>0 才认为有效）
                 if not resume and sampling_path.exists():
                     existing = load_json(str(sampling_path))
-                    if existing.get("summary", {}).get("total", 0) > 0:
+                    expected_config = {
+                        "k_trials": k_trials,
+                        "experiment_seed": experiment_seed,
+                        "temperature": temperature,
+                        "top_p": top_p,
+                        "top_logprobs": top_logprobs,
+                        "early_stop": False,
+                    }
+                    existing_config = existing.get("config", {}) if isinstance(existing, dict) else {}
+                    compatible = (
+                        existing.get("schema_version") == "stage1.1"
+                        and all(existing_config.get(key) == value for key, value in expected_config.items())
+                    )
+                    compatible = compatible and existing.get("dataset_sha256") == dataset_sha256
+                    if existing.get("summary", {}).get("total", 0) > 0 and compatible:
                         logger.info("[Stage 1.1 %s] final file already exists (total=%d): %s",
                                      tag, existing["summary"]["total"], sampling_path)
                         sampling_data = existing
+                    elif existing.get("summary", {}).get("total", 0) > 0:
+                        raise ValueError(
+                            f"Existing Stage 1 output uses a different protocol/config: {sampling_path}. "
+                            "Use another --backbone tag or archive the old output."
+                        )
                     else:
                         logger.warning("[Stage 1.1 %s] empty/corrupt, deleting and re-sampling: %s",
                                        tag, sampling_path)
@@ -569,8 +531,13 @@ class AgentPipeline:
                         model=_model,
                         api_key=self.execute.api_key,
                         k_trials=k_trials,
+                        experiment_seed=experiment_seed,
                         temperature=temperature,
-                        max_tokens=4096,
+                        top_p=top_p,
+                        top_logprobs=top_logprobs,
+                        entropy_histogram_bins=entropy_histogram_bins,
+                        max_tokens=max_tokens,
+                        task_batch_size=task_batch_size,
                         timeout=self.execute.timeout,
                     )
                     sampling_data = await sampler.sample_all(
@@ -578,47 +545,40 @@ class AgentPipeline:
                         checkpoint_path=sampling_ckpt,
                         collect_all_samples=collect_all_samples,
                     )
+                    sampling_data["dataset_sha256"] = dataset_sha256
                     Stage1Sampler.save(sampling_data, sampling_path)
-                    # 跑完后删除 checkpoint
-                    if ckpt_file.exists():
+                    incomplete = int(sampling_data.get("summary", {}).get("incomplete", 0))
+                    if incomplete == 0 and ckpt_file.exists():
                         ckpt_file.unlink()
+                    if incomplete:
+                        raise RuntimeError(
+                            f"Stage 1 has {incomplete} incomplete question(s); checkpoint retained at {ckpt_file}. "
+                            "Resume with the same configuration before building Learning Bundles."
+                        )
 
             summary = sampling_data.get("summary", {})
             level_data = sampling_data.get("level_data", {})
 
-            # When collect_all_samples=True, regenerate level_data from full results
-            # (needed when reusing sampling data originally created without this flag)
+            # Master/Learning/Panic are immutable capability zones.  The legacy
+            # collect_all_samples flag may retain every result for analysis, but it
+            # must never promote Master or Panic questions into Learning Levels.
             if collect_all_samples:
-                all_results = sampling_data.get("results", [])
-                if all_results:
-                    level_data = {"1": [], "2": [], "3": [], "4": []}
-                    for r in all_results:
-                        if r.get("zone") == "no_data":
-                            continue
-                        level = Stage1Sampler.level_from_result(r)
-                        if level <= 0:
-                            continue
-                        r["assigned_level"] = level
-                        level_data[str(level)].append(r)
-                    logger.info(
-                        "[%s] collect_all_samples: regenerated level_data from %d results → L1=%d L2=%d L3=%d L4=%d",
-                        tag, len(all_results),
-                        len(level_data["1"]), len(level_data["2"]),
-                        len(level_data["3"]), len(level_data["4"]),
-                    )
+                logger.warning(
+                    "[%s] collect_all_samples is retained only as a legacy analysis flag; "
+                    "Master and Panic remain outside level1-level4 Learning Bundles.",
+                    tag,
+                )
 
             if not level_data:
                 logger.error("[%s] no samples to process (all zones empty)", tag)
                 return None
 
-            # ── Step 1.2: Mining + Diff + 打包 ──
+            # ── Step 1.2: deterministic evidence bundling and rankings ──
             miner = Stage1Miner(
-                urls=_urls,
-                model=_model,
-                api_key=self.execute.api_key,
-                timeout=self.execute.timeout,
+                experiment_seed=experiment_seed,
+                dataset_sha256=dataset_sha256,
             )
-            mining_result = await miner.run(level_data, concurrency=diff_concurrency)
+            mining_result = await miner.run(level_data)
 
             packets = mining_result.get("packets", {})
             stats = mining_result.get("stats", {})
@@ -626,6 +586,23 @@ class AgentPipeline:
             # 保存 —— 按 backbone 分目录
             packets_dir = stage1_level_packets_file(output_root, 1, backbone).parent
             Stage1Miner.save(packets, packets_dir)
+            stage1_root = packets_dir.parent.parent
+            save_rankings_and_manifests(mining_result.get("rankings", {}), stage1_root)
+            write_analysis_csv(packets, stage1_root / "analysis" / "questions.csv")
+            from scripts.stage1.analyze import generate_figures
+            figure_paths = generate_figures(stage1_root)
+            (stage1_root / "run_manifest.json").write_text(json.dumps({
+                "schema_version": "stage1.1",
+                "dataset_path": str(Path(src).resolve()),
+                "dataset_sha256": dataset_sha256,
+                "dataset_size": len(tasks),
+                "invalid_input_indices": missing,
+                "model": _model,
+                "ports": _urls,
+                "sampling_config": sampling_data.get("config", {}),
+                "ranking_policies": ["random", "high_token_entropy", "low_token_entropy"],
+                "figures": [str(path) for path in figure_paths],
+            }, ensure_ascii=False, indent=2), encoding="utf-8")
 
             summary_path = packets_dir / "stage1_summary.json"
             with open(summary_path, "w", encoding="utf-8") as f:
@@ -642,11 +619,11 @@ class AgentPipeline:
                 _jm.dump(runtime.finish(), f, ensure_ascii=False, indent=2)
 
             logger.info(
-                "Stage 1 [%s] done: total=%d | M=%d L=%d P=%d | pairs=%d (diff_ok=%d)",
+                "Stage 1 [%s] done: total=%d | M=%d L=%d P=%d | deterministic_pairs=%d",
                 tag, summary.get("total", 0),
                 summary.get("master_zone", 0), summary.get("learning_zone", 0),
                 summary.get("panic_zone", 0),
-                stats.get("total_pairs_found", 0), stats.get("diff_success", 0),
+                stats.get("total_pairs_found", 0),
             )
             return packets_dir
 
@@ -859,468 +836,6 @@ class AgentPipeline:
         logger.info("Stage 1b summary saved: %s", summary_path)
 
         return result
-
-    # ================================================================
-    # Stage 2: 记忆构建
-    # ================================================================
-
-    async def stage2_memorize(
-        self,
-        dataset: str,
-        round_id: int,
-        validation_concurrency: int = 8,
-        backbone: str = "",
-        max_records: int = 0,
-        run_tag: str = "",
-        dsd_cache_dir: str = "",
-        rebuild_dsd: bool = False,
-        prepare_dsd_only: bool = False,
-        prepare_candidates_only: bool = False,
-        candidate_bank: str = "",
-        neighbor_validation: bool = True,
-        gate_only: bool = False,
-        selection_file: str = "",
-        artifact_dir: str = "",
-        candidate_concurrency: int = 0,
-    ) -> Dict[str, Any]:
-        """Stage 2 v3: causally validate and version reusable memories."""
-        from modules.stage2_v3 import run_stage2_v3
-
-        return await run_stage2_v3(
-            self,
-            dataset=dataset,
-            round_id=round_id,
-            validation_concurrency=validation_concurrency,
-            backbone=backbone,
-            max_records=max_records,
-            run_tag=run_tag,
-            dsd_cache_dir=dsd_cache_dir,
-            rebuild_dsd=rebuild_dsd,
-            prepare_dsd_only=prepare_dsd_only,
-            prepare_candidates_only=prepare_candidates_only,
-            candidate_bank=candidate_bank,
-            neighbor_validation=neighbor_validation,
-            gate_only=gate_only,
-            selection_file=selection_file,
-            artifact_dir=artifact_dir,
-            candidate_concurrency=candidate_concurrency,
-        )
-
-    async def stage2_memorize_legacy(
-        self,
-        dataset: str,
-        round_id: int,
-        validation_concurrency: int = 8,
-        backbone: str = "",
-    ) -> Dict[str, Any]:
-        """Stage 2: DSD-guided principle selection and memory construction."""
-        metrics_context = collect_runtime_metrics("stage2", {"dataset": dataset, "round_id": round_id})
-        runtime = metrics_context.__enter__()
-        self.memory.load()
-        initial = self.memory.principle_count
-        if initial > 0 and not self.memory.is_indexed:
-            self.memory.build_indices()
-        logger.info("Stage 2: memory build (dataset=%s, round=%d, backbone=%s, existing=%d)", dataset, round_id, backbone or "default", initial)
-
-        # 优先使用新版路径 (output/stage1/02_learning_packets/{backbone}/level{N}_...), 回退旧路径
-        _bk = backbone or os.environ.get("MEMUA_BACKBONE", "")
-        _level_match = re.search(r"(\d+)", str(dataset))
-        _level = int(_level_match.group(1)) if _level_match else round_id
-        lp_path_new = stage1_level_packets_file(self.config.paths.output_dir, _level, _bk) if _bk else None
-        lp_path_old = stage1_learning_packets_file(self.config.paths.output_dir, dataset)
-        if lp_path_new and lp_path_new.exists():
-            lp_path = lp_path_new
-        else:
-            lp_path = lp_path_old
-        logger.info("Stage 2: reading learning packets: %s", lp_path)
-        packets = load_json(str(lp_path)) if lp_path.exists() else []
-        if not isinstance(packets, list) or not packets:
-            logger.warning("Stage 1 output missing or empty, skipping Stage 2")
-            summary = {"dataset": dataset, "round_id": round_id, "status": "empty_stage1"}
-            summary["runtime_metrics"] = runtime.finish()
-            metrics_context.__exit__(None, None, None)
-            return summary
-
-        registry = DSDRegistry(dataset=dataset, round_id=round_id, output_root=self.config.paths.output_dir, backbone=backbone)
-        dsd_concurrency = max(1, int(os.environ.get("MEMUA_STAGE2_DSD_CONCURRENCY", "32")))
-        logger.info("Stage 2: building DSD registry from %d learning packets", len(packets))
-        registry_summary = await registry.build(packets, self.plan, concurrency=dsd_concurrency)
-        registry.save()
-        logger.info(
-            "Stage 2: DSD registry ready with %d records; starting principle validation (dsd_concurrency=%d)",
-            len(registry.records),
-            dsd_concurrency,
-        )
-
-        stage2_units: List[Dict[str, Any]] = []
-        stats = {"added": 0, "updated": 0, "duplicated": 0, "skipped": 0}
-        stage2_neighbor_pass_ratio_threshold = float(
-            os.environ.get("MEMUA_STAGE2_NEIGHBOR_PASS_RATIO_THRESHOLD", "0.6")
-        )
-        stage2_neighbor_top_k = max(1, int(os.environ.get("MEMUA_STAGE2_NEIGHBOR_TOP_K", "5")))
-        max_principle_rounds = max(1, int(os.environ.get("MEMUA_STAGE2_MAX_GENERATION_ROUNDS", "3")))
-        max_candidates_per_round = max(1, int(os.environ.get("MEMUA_STAGE2_MAX_CANDIDATES_PER_ROUND", "2")))
-        candidate_total = 0
-        source_pass_total = 0
-        full_neighbor_pass_total = 0
-        total_generation_rounds = 0
-        attempted_stage2_units = 0
-
-        def _principle_text(candidate: Dict[str, Any]) -> str:
-            text = str(candidate.get("principle", "") or candidate.get("action_guidance", "") or "").strip()
-            if text:
-                return text
-            parts = [str(candidate.get(key, "")).strip() for key in ("trigger_condition", "action_guidance", "scope")]
-            return " ".join(part for part in parts if part)
-
-        generation_semaphore = asyncio.Semaphore(max(1, int(os.environ.get("MEMUA_STAGE2_GENERATION_CONCURRENCY", str(validation_concurrency)))))
-        reconcile_semaphore = asyncio.Semaphore(max(1, int(os.environ.get("MEMUA_STAGE2_RECONCILE_CONCURRENCY", "4"))))
-
-        async def _run_reconcile_judge(
-            question: str,
-            new_principle: str,
-            existing_question: str,
-            existing_principle: str,
-        ) -> Dict[str, Any]:
-            async with reconcile_semaphore:
-                return await self.plan.judge_principle_consistency(
-                    question=question,
-                    new_principle=new_principle,
-                    existing_question=existing_question,
-                    existing_principle=existing_principle,
-                )
-
-        stage2_repair_max_depth = max(1, int(os.environ.get("MEMUA_STAGE2_REPAIR_MAX_DEPTH", "3")))
-
-        async def process_stage2_record(record: Dict[str, Any]) -> tuple[Dict[str, Any], Dict[str, int]]:
-            local_stats = {
-                "candidate_total": 0,
-                "source_pass_total": 0,
-                "full_neighbor_pass_total": 0,
-                "total_generation_rounds": 0,
-                "repair_rounds": 0,
-                "attempted_stage2_units": 0,
-            }
-
-            diff_ok = ((record.get("contrast") or {}).get("status") == "success")
-            has_pair = all([
-                str(record.get("question_text", "")).strip(),
-                str(record.get("expected_answer", "")).strip(),
-                str(record.get("chosen_trajectory", "")).strip(),
-                str(record.get("hard_negative_trajectory", "")).strip(),
-            ])
-            source_dsd = record.get("source_dsd") or {}
-            has_semantics = any(
-                str(source_dsd.get(key, "")).strip()
-                for key in (CORE_FIELD, CONDITION_FIELD, TARGET_FIELD)
-            )
-            stage2_candidate = bool(record.get("stage2_candidate", False)) or bool(
-                (record.get("source_metadata") or {}).get("stage2_candidate", False)
-            )
-            if not stage2_candidate:
-                stage2_candidate = diff_ok and has_pair
-
-            if not stage2_candidate:
-                return {"question_id": record["question_id"], "status": "skipped", "reason": "not_stage2_candidate"}, local_stats
-            if not has_semantics:
-                return {"question_id": record["question_id"], "status": "skipped", "reason": "missing_semantics"}, local_stats
-
-            neighbors = registry.get_neighbors(record["question_id"], top_k=stage2_neighbor_top_k)
-            if not neighbors:
-                return {"question_id": record["question_id"], "status": "skipped", "reason": "no_neighbors"}, local_stats
-
-            stage2_unit: Dict[str, Any] = {
-                "question_id": record["question_id"],
-                "source_question_text": record["question_text"],
-                "question_text": record["question_text"],
-                "expected_answer": record["expected_answer"],
-                "source_dsd": record["source_dsd"],
-                "neighbor_questions": neighbors,
-                "status": "pending",
-            }
-            local_stats["attempted_stage2_units"] += 1
-
-            # ── Step 1: 获取 diff (复用 Stage 1 或重新分析) ──
-            stage1_diff = (record.get("contrast") or {}).get("differences", [])
-            if isinstance(stage1_diff, list) and stage1_diff:
-                diff_list = stage1_diff
-            else:
-                async with generation_semaphore:
-                    diff_result = await self.plan.diff_analysis(
-                        record["question_text"],
-                        record.get("chosen_trajectory", ""),
-                        record.get("hard_negative_trajectory", ""),
-                        record["source_dsd"],
-                        record.get("divergence_step_text", ""),
-                        int(record.get("divergence_step_idx", 0) or 0),
-                    )
-                    diff_list = diff_result.get("differences", []) if diff_result.get("status") == "success" else []
-
-            if not diff_list:
-                stage2_unit["status"] = "no_diff"
-                return stage2_unit, local_stats
-
-            # ── Step 2: Self-CPE — 从 diff + 内省提取一条防御性原则 ──
-            async with generation_semaphore:
-                cpe_result = await self.plan.self_cpe_extract(
-                    question=record["question_text"],
-                    diff_list=diff_list,
-                    source_dsd=record["source_dsd"],
-                )
-
-            if cpe_result.get("status") != "success":
-                stage2_unit["status"] = "cpe_failed"
-                return stage2_unit, local_stats
-
-            local_stats["candidate_total"] += 1
-            principle = cpe_result.get("principle", {})
-
-            # ── Step 3: 邻域验证 + 递归修复协议 ──
-            repair = RecursiveRepairProtocol(
-                plan_module=self.plan,
-                max_depth=stage2_repair_max_depth,
-                pass_threshold=stage2_neighbor_pass_ratio_threshold,
-                validation_concurrency=validation_concurrency,
-            )
-            repair_result = await repair.run(
-                principle=principle,
-                neighbors=neighbors,
-                source_dsd=record["source_dsd"],
-            )
-
-            stage2_unit["repair_result"] = {
-                "status": repair_result["status"],
-                "repair_history": repair_result.get("repair_history", []),
-            }
-            local_stats["repair_rounds"] += len(repair_result.get("repair_history", []))
-
-            if repair_result["status"] != "validated":
-                local_stats["total_generation_rounds"] += 1 + local_stats["repair_rounds"]
-
-                stage2_unit["status"] = "repair_discarded"
-                return stage2_unit, local_stats
-
-            # ── Step 4: 组装 validated_principle (兼容现有 memory 接口) ──
-            final_validation = repair_result.get("final_validation", {})
-            final_principle = repair_result["principle"]
-            neighbor_results_raw = final_validation.get("results", [])
-            neighbor_pass_count = final_validation.get("pass_count", 0)
-            neighbor_total = final_validation.get("total", len(neighbors))
-            neighbor_pass_ratio = final_validation.get("pass_ratio", 0.0)
-
-            # 转为兼容格式
-            neighbor_results = []
-            for nr in neighbor_results_raw:
-                neighbor_results.append({
-                    "question_id": nr.get("neighbor_id", ""),
-                    "question_text": nr.get("neighbor_question", ""),
-                    "passed": nr.get("is_correct", False),
-                    "response": nr.get("response", ""),
-                    "attempt_count": nr.get("attempt_count", 1),
-                    "rescued_by_retry": nr.get("rescued_by_retry", False),
-                })
-
-            principle_text = _principle_text_for_memory(final_principle)
-            if not principle_text:
-                parts = [
-                    str(final_principle.get("trigger_condition", "")).strip(),
-                    str(final_principle.get("action_guidance", "")).strip(),
-                    str(final_principle.get("scope", "")).strip(),
-                ]
-                principle_text = " ".join(part for part in parts if part)
-
-            validated_principle = {
-                **final_principle,
-                "content": dict(final_principle),
-                "principle": principle_text,
-                "principle_text": principle_text,
-                "source_question_id": record["question_id"],
-                "source_question_text": record["question_text"],
-                "source_dsd": record["source_dsd"],
-                "neighbor_pass_count": neighbor_pass_count,
-                "neighbor_total_count": neighbor_total,
-                "neighbor_pass_ratio": neighbor_pass_ratio,
-                "neighbor_gate_pass": True,
-                "neighbor_cases": neighbor_results,
-                "validated_neighbors": neighbor_results,
-                "qualified_for_memory": True,
-                "rank_score": neighbor_pass_ratio,
-                "status": "active",
-                "round_id": round_id,
-                "source_round": round_id,
-                "source_dataset": dataset,
-            }
-            local_stats["full_neighbor_pass_total"] += 1
-            local_stats["total_generation_rounds"] += 1 + local_stats["repair_rounds"]
-
-            stage2_unit["validated_principle"] = validated_principle
-            stage2_unit["status"] = "validated"
-
-            return stage2_unit, local_stats
-
-        validation_records = [
-            record for record in registry.records
-            if record.get("stage2_candidate", False) and ((record.get("contrast") or {}).get("status") == "success")
-        ]
-        logger.info(
-            "Stage 2: validating %d candidate records (neighbor_top_k=%d, max_candidates_per_round=%d)",
-            len(validation_records),
-            stage2_neighbor_top_k,
-            max_candidates_per_round,
-        )
-        validation_tasks = [process_stage2_record(record) for record in validation_records]
-        done_count = 0
-        total_count = len(validation_tasks)
-        for coro in async_tqdm(asyncio.as_completed(validation_tasks), total=total_count, desc=f"Stage 2 validation ({dataset})"):
-            stage2_unit, local_stats = await coro
-            stage2_units.append(stage2_unit)
-            candidate_total += local_stats["candidate_total"]
-            source_pass_total += local_stats["source_pass_total"]
-            full_neighbor_pass_total += local_stats["full_neighbor_pass_total"]
-            total_generation_rounds += local_stats["total_generation_rounds"]
-            attempted_stage2_units += local_stats["attempted_stage2_units"]
-            done_count += 1
-            if done_count % 10 == 0 or done_count == total_count:
-                logger.info("Stage 2 validation progress: %d/%d (%s)", done_count, total_count, dataset)
-
-        stage2_units.sort(key=lambda item: str(item.get("question_id", "")))
-
-        stats = {"added": 0, "updated": 0, "duplicated": 0, "skipped": 0, "merged": 0, "replaced": 0}
-        validated_principles = [unit["validated_principle"] for unit in stage2_units if unit.get("status") == "validated" and unit.get("validated_principle")]
-        pending_memory_candidates = sorted(validated_principles, key=_candidate_rank_key, reverse=True)
-        if validated_principles:
-            logger.info("Stage 2: reconciling %d validated principles before memory ingest", len(validated_principles))
-            if self.memory.principle_count > 0 and not self.memory.is_indexed:
-                self.memory.build_indices()
-
-            for principle in pending_memory_candidates:
-                strict_matches = self.memory.retrieve_strict_semantic_matches(
-                    principle.get("source_dsd", {}),
-                    facet_threshold=STRICT_MEMORY_RECONCILE_THRESHOLD,
-                    top_k=5,
-                )
-
-                if not strict_matches:
-                    current = self.memory.ingest_validated_principles(
-                        [principle], round_id, dataset, auto_dedup=False,
-                    )
-                    for key in ("added", "updated", "duplicated", "skipped"):
-                        stats[key] += current.get(key, 0)
-                    continue
-
-                existing = strict_matches[0]["item"]
-                existing_principle = str(existing.get("principle", "")).strip()
-                new_principle = _principle_text_for_memory(principle)
-                decision = _fast_reconcile_principles(new_principle, existing_principle)
-                if decision is None:
-                    decision = await _run_reconcile_judge(
-                        question=str(principle.get("source_question_text", "")).strip(),
-                        new_principle=new_principle,
-                        existing_question=str(existing.get("question", "")).strip(),
-                        existing_principle=existing_principle,
-                    )
-                principle["memory_reconciliation"] = {
-                    "strict_matches": strict_matches,
-                    "decision": decision,
-                }
-
-                action = decision.get("decision", "add_as_new")
-                existing_id = str(existing.get("memory_id", "")).strip()
-                merged_principle = str(decision.get("merged_principle", "")).strip() or new_principle
-
-                if action == "replace_existing" and existing_id:
-                    replacement_content = dict(principle.get("content", {}))
-                    replacement_content["action_guidance"] = merged_principle
-                    self.memory.memory.update(existing_id, {
-                        "principle": merged_principle,
-                        "principle_text": merged_principle,
-                        "content": replacement_content,
-                        **replacement_content,
-                        "source_round": round_id,
-                        "source_dataset": dataset,
-                        "source_dsd": principle.get("source_dsd", {}),
-                        "validated_neighbors": principle.get("validated_neighbors", []),
-                        "quality_metrics": {
-                            **(existing.get("quality_metrics", {}) or {}),
-                            **(principle.get("quality_metrics", {}) or {}),
-                            "memory_reconcile_action": "replace_existing",
-                            "memory_reconcile_reason": decision.get("reason", ""),
-                        },
-                        "operation": "REPLACE",
-                        "update_reason": decision.get("reason", ""),
-                    })
-                    stats["updated"] += 1
-                    stats["replaced"] += 1
-                elif action == "merge_with_existing" and existing_id:
-                    merged_content = dict(principle.get("content", {}))
-                    merged_content["action_guidance"] = merged_principle
-                    self.memory.memory.update(existing_id, {
-                        "principle": merged_principle,
-                        "principle_text": merged_principle,
-                        "content": merged_content,
-                        **merged_content,
-                        "validated_neighbors": principle.get("validated_neighbors", []),
-                        "quality_metrics": {
-                            **(existing.get("quality_metrics", {}) or {}),
-                            **(principle.get("quality_metrics", {}) or {}),
-                            "memory_reconcile_action": "merge_with_existing",
-                            "memory_reconcile_reason": decision.get("reason", ""),
-                        },
-                        "operation": "MERGE",
-                        "update_reason": decision.get("reason", ""),
-                    })
-                    stats["updated"] += 1
-                    stats["merged"] += 1
-                else:
-                    current = self.memory.ingest_validated_principles(
-                        [principle], round_id, dataset, auto_dedup=False,
-                    )
-                    for key in ("added", "updated", "duplicated", "skipped"):
-                        stats[key] += current.get(key, 0)
-        else:
-            logger.warning("No validated principles passed the Stage 2 gate for %s", dataset)
-
-        # 构建索引
-        logger.info("Stage 2: saving final memory indices and snapshot for %s", dataset)
-        self.memory.build_indices()
-        self.memory.save_indices()
-
-        # 保存 + 快照
-        self.memory.save()
-        self.memory.snapshot(round_id)
-
-        final = self.memory.principle_count
-        summary = {
-            "dataset": dataset,
-            "round_id": round_id,
-            "total_stage2_units": len(stage2_units),
-            "validation_records": len(validation_records),
-            "neighbor_top_k": stage2_neighbor_top_k,
-            "max_candidates_per_round": max_candidates_per_round,
-            "total_candidates_generated": candidate_total,
-            "source_pass_rate": (source_pass_total / candidate_total) if candidate_total else 0.0,
-            "full_neighbor_pass_rate": (full_neighbor_pass_total / candidate_total) if candidate_total else 0.0,
-            "average_generation_rounds": (total_generation_rounds / attempted_stage2_units) if attempted_stage2_units else 0.0,
-            "pending_memory_candidates": len(pending_memory_candidates),
-            "principles_inserted": stats.get("added", 0),
-            "principles_updated": stats.get("updated", 0),
-            "principles_merged": stats.get("merged", 0),
-            "principles_replaced": stats.get("replaced", 0),
-            "principles_rejected": stats.get("duplicated", 0) + stats.get("skipped", 0),
-            "memory_before": initial,
-            "memory_after": final,
-            "registry_summary": registry_summary,
-        }
-        summary["runtime_metrics"] = runtime.finish()
-        save_json(stage2_units, str(stage2_memory_file(self.config.paths.output_dir, dataset, backbone)))
-        save_json(summary, str(stage2_summary_file(self.config.paths.output_dir, dataset, backbone)))
-        metrics_context.__exit__(None, None, None)
-        logger.info("Stage 2 done: %d → %d principles, round_%d snapshotted", initial, final, round_id)
-        return summary
-
-    # ================================================================
-    # Stage 3: 检索增强评估
-    # ================================================================
 
     async def stage3_evaluate(
         self,
@@ -1578,7 +1093,7 @@ class AgentPipeline:
         progress_state = _bootstrap_stage3_progress_from_previous_round(
             progress_state,
             root=output_root,
-            dataset=f"dpo_level{current_level}",
+            dataset=f"level{current_level}",
             eval_level=current_level,
             test_data=test_data,
             backbone=backbone,
@@ -1655,7 +1170,7 @@ class AgentPipeline:
                 progress_state=progress_state,
                 evaluated_results=eval_results,
                 carried_correct=carried_correct,
-                dataset=f"dpo_level{current_level}",
+                dataset=f"level{current_level}",
                 eval_level=current_level,
             )
             progress_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1917,299 +1432,3 @@ class AgentPipeline:
             "total_panic": len(panic_samples),
             "target_level": target_level,
         }
-
-    # ================================================================
-    # 全流程: 多轮课程学习
-    # ================================================================
-
-    async def run_full_curriculum(
-        self,
-        levels: Sequence[int] = (1, 2, 3, 4),
-        backbone: str = "",
-        test_input: Optional[Path] = None,
-        concurrency: int = 64,
-        diff_concurrency: int = 64,
-        stage2_concurrency: int = 64,
-        eval_concurrency: int = 64,
-        mining_concurrency: int = 64,
-        skip_sampling: bool = False,
-        skip_mining: bool = False,
-        start_level: int = 1,
-    ) -> Dict[str, Any]:
-        """课程学习全流程 — 每个 level 就是一个 round.
-
-        Round 1 (Level 1):
-          Stage 1: 全局 K-trial 采样 → 三区划分 → 四级分 pack → mining + diff
-          Stage 2: Level 1 记忆化 (DSD → Self-CPE → 验证)
-          Stage 3: Panic 救援 (memory 引导答题, 救活→追加到高 level packet)
-
-        Round 2-4 (Level 2-4):
-          Stage 1: Panic 区重采样 (用累积 memory 引导, K=10, 救活→mining→追加)
-          Stage 2: 当前 level 记忆化
-          Stage 3: Panic 救援
-        """
-        all_summaries: Dict[str, Any] = {}
-
-        active_levels = [l for l in levels if l >= start_level]
-        if start_level > 1:
-            logger.info("Skipping levels %s (start_level=%d)", [l for l in levels if l < start_level], start_level)
-            # Ensure memory is loaded from disk (contains principles from skipped levels)
-            if not self.memory.is_indexed:
-                self.memory.load()
-                if not self.memory.is_indexed:
-                    self.memory.build_indices()
-                    self.memory.save_indices()
-
-        for level in active_levels:
-            round_label = f"Round {level}/4"
-            dataset = f"dpo_level{level}"
-            logger.info("=" * 60)
-            logger.info("%s: Level %d — %s", round_label, level, dataset)
-            logger.info("=" * 60)
-
-            all_summaries[f"round_{level}"] = {}
-
-            # ═══ Stage 1 ═══
-            if level == 1 and not skip_sampling:
-                logger.info("Stage 1 (global): unified sampling + 3-zone + 4-level pack + mining + diff")
-                packets_dir = await self.stage1_learn(
-                    concurrency=concurrency,
-                    diff_concurrency=diff_concurrency,
-                    skip_sampling=False,
-                    backbone=backbone,
-                )
-                all_summaries[f"round_{level}"]["stage1"] = str(packets_dir) if packets_dir else None
-                if packets_dir is None:
-                    logger.error("Stage 1 failed, cannot continue")
-                    return all_summaries
-            elif level > 1:
-                logger.info("Stage 1 (panic resample): memory=%d principles", self.memory.principle_count)
-                panic_result = await self.stage1_panic_resample(
-                    backbone=backbone,
-                    concurrency=concurrency,
-                    diff_concurrency=diff_concurrency,
-                )
-                all_summaries[f"round_{level}"]["stage1"] = panic_result
-                logger.info(
-                    "Stage 1 done: %d/%d panic rescued -> +%d packets",
-                    panic_result.get("rescued", 0),
-                    panic_result.get("total_panic", 0),
-                    panic_result.get("new_packets", 0),
-                )
-            else:
-                all_summaries[f"round_{level}"]["stage1"] = "skipped"
-
-            # ═══ Stage 2: 记忆化 ═══
-            stage2_summary = await self.stage2_memorize(
-                dataset=dataset,
-                round_id=level,
-                validation_concurrency=stage2_concurrency,
-                backbone=backbone,
-            )
-
-            # ═══ Stage 3: Panic 救援 (Round 1-3) / 最终评估 (Round 4) ═══
-            if level < 4:
-                stage3_summary = await self.stage3_remediate_panic(
-                    backbone=backbone,
-                    current_level=level,
-                    test_input=test_input or self.config.paths.test_dir / "deepscaler.json",
-                    concurrency=stage2_concurrency,
-                    eval_concurrency=eval_concurrency,
-                    mining_concurrency=mining_concurrency,
-                )
-                _eval = stage3_summary.get("evaluation", {})
-                rescued = stage3_summary.get("rescued", 0)
-                total_panic = stage3_summary.get("total_panic", 0)
-                new_pkts = stage3_summary.get("new_packets", 0)
-                levels_updated = stage3_summary.get("levels_updated", {})
-                lv_str = ", ".join(f"L{lv}:+{n}" for lv, n in sorted(levels_updated.items())) if levels_updated else "none"
-                logger.info(
-                    ">>> %s complete: "
-                    "eval accuracy=%.4f (%d/%d) | "
-                    "rescued %d/%d panic -> %s (%d packets) | "
-                    "memory %d principles",
-                    round_label,
-                    _eval.get("accuracy", 0.0), _eval.get("correct", 0), _eval.get("scope_total", 0),
-                    rescued, total_panic, lv_str, new_pkts,
-                    self.memory.principle_count,
-                )
-            else:
-                # Round 4: 最终 guided 评估
-                logger.info("Stage 3 (final eval): guided evaluation with accumulated memory")
-                test_path = test_input or self.config.paths.test_dir / "deepscaler.json"
-                test_data = load_json(str(test_path))
-                test_scope_key = _stage3_test_scope_key(str(test_path))
-                eval_result = await self.stage3_evaluate(
-                    test_data=test_data,
-                    threshold=0.55,
-                    top_k=5,
-                    concurrency=eval_concurrency,
-                    eval_level=level,
-                    dataset=dataset,
-                    progress_state_path=stage3_progress_state_file(self.config.paths.output_dir, test_scope_key, backbone),
-                    test_scope_key=test_scope_key,
-                    backbone=backbone,
-                )
-                stage3_summary = eval_result["summary"]
-
-                # Save results and summary to disk
-                out_root = self.config.paths.output_dir
-                save_json(eval_result["results"], str(stage3_guided_results_file(out_root, dataset, backbone)))
-                save_json(eval_result["summary"], str(stage3_guided_summary_file(out_root, dataset, backbone)))
-
-                perf = stage3_summary.get("performance", {})
-                logger.info(
-                    ">>> %s complete: "
-                    "final accuracy=%.4f (%d/%d) | "
-                    "memory %d principles",
-                    round_label,
-                    perf.get("accuracy", 0.0), perf.get("correct", 0), perf.get("scope_total", 0),
-                    self.memory.principle_count,
-                )
-
-            all_summaries[f"round_{level}"][dataset] = {
-                "stage2": stage2_summary,
-                "stage3": stage3_summary,
-            }
-
-        logger.info("=" * 60)
-        logger.info("All %d rounds complete!", len(active_levels))
-        logger.info("=" * 60)
-        return all_summaries
-
-
-# ── 辅助函数 ─────────────────────────────────────────────────
-
-
-def _extract_key_lines(trajectory: str, max_lines: int = 50) -> str:
-    """提取轨迹中含数学操作的关键行。"""
-    _MATH_PATTERN = re.compile(
-        r"[=<>≤≥∈∉∑∏∫\\]|\\frac|\\sqrt|\\boxed|\\cdot|\\times|Final Answer",
-        re.IGNORECASE,
-    )
-    lines = trajectory.splitlines()
-    key_lines = [line for line in lines if _MATH_PATTERN.search(line)]
-    if len(key_lines) < 5:
-        key_lines = lines
-    return "\n".join(key_lines[:max_lines])
-
-
-# ══════════════════════════════════════════════════════════════
-# CLI 入口
-# ══════════════════════════════════════════════════════════════
-
-async def _cli_main():
-    import argparse
-
-    parser = argparse.ArgumentParser(
-        description="MemMetaV3 Agent Pipeline — 统一编排",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-示例:
-  # 全流程 (Stage 1 + Round 1-4)
-  python -m core.agent_pipeline --levels 1 2 3 4 --ports 8000 8001
-
-  # 从 Level 2 恢复 (跳过已完成的 Round 1)
-  python -m core.agent_pipeline --levels 1 2 3 4 --start-level 2 --skip-sampling
-
-  # 仅跑 Stage 3 (需要 memory/ 已有数据)
-  python -m core.agent_pipeline --stage 3 --levels 1
-
-  # 跳过采样和挖掘 (复用已有 Stage 1 中间结果)
-  python -m core.agent_pipeline --levels 1 --skip-sampling --skip-mining
-""",
-    )
-    parser.add_argument("--levels", type=int, nargs="+", default=[1, 2, 3, 4])
-    parser.add_argument("--stage", type=int, choices=[1, 2, 3], default=None,
-                        help="仅运行指定 stage")
-    parser.add_argument("--dataset", "-d", type=str, default=None,
-                        help="仅处理指定数据集 (与 --stage 配合)")
-    parser.add_argument("--test-input", type=str, default=None,
-                        help="测试集路径 (--stage 3 或全流程评估用, 默认 data/test/deepscaler.json)")
-    parser.add_argument("--memory-dir", type=str, default="memory/v3")
-    parser.add_argument("--model", "-m", type=str, default=None)
-    parser.add_argument("--ports", type=int, nargs="+", default=None)
-    parser.add_argument("--concurrency", type=int, default=64)
-    parser.add_argument("--diff-concurrency", type=int, default=64)
-    parser.add_argument("--eval-concurrency", type=int, default=64)
-    parser.add_argument("--stage2-limit", type=int, default=0)
-    parser.add_argument("--stage2-run-tag", type=str, default="")
-    parser.add_argument("--threshold", type=float, default=0.55)
-    parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--skip-sampling", action="store_true")
-    parser.add_argument("--skip-mining", action="store_true")
-    parser.add_argument("--start-level", type=int, default=1, help="从指定 level 开始 (1-4), 跳过已完成 level 的 Stage 2-3")
-    parser.add_argument("--backbone", type=str, default="", help="模型标识 (qwen/llama), 用于定位新版 Stage 1 产物")
-    args = parser.parse_args()
-
-    config = Config.from_core_file()
-    config.ensure_dirs()
-    config.setup_logging()
-
-    memory_dir = Path(args.memory_dir) / args.backbone if args.backbone else Path(args.memory_dir)
-    pipeline = AgentPipeline(
-        config=config,
-        ports=args.ports,
-        model_override=args.model,
-        memory_dir=str(memory_dir),
-    )
-
-    if args.stage is not None:
-        # 单 Stage 模式
-        dataset = args.dataset or "dpo_level1"
-        level = int(dataset.replace("dpo_level", "")) if "level" in dataset else 1
-        if args.stage == 1:
-            await pipeline.stage1_learn(
-                dataset=dataset,
-                concurrency=args.concurrency,
-                diff_concurrency=args.diff_concurrency,
-                skip_sampling=args.skip_sampling,
-                backbone=args.backbone,
-            )
-        elif args.stage == 2:
-            await pipeline.stage2_memorize(
-                dataset=dataset,
-                round_id=level,
-                backbone=args.backbone,
-                max_records=args.stage2_limit,
-                run_tag=args.stage2_run_tag,
-            )
-        elif args.stage == 3:
-            test_path = args.test_input or str(config.paths.test_dir / "deepscaler.json")
-            test_data = load_json(test_path)
-            test_scope_key = _stage3_test_scope_key(test_path)
-            result = await pipeline.stage3_evaluate(
-                test_data=test_data,
-                threshold=args.threshold,
-                top_k=args.top_k,
-                concurrency=args.eval_concurrency,
-                eval_level=level,
-                dataset=dataset,
-                progress_state_path=stage3_progress_state_file(config.paths.output_dir, test_scope_key, args.backbone),
-                test_scope_key=test_scope_key,
-                backbone=args.backbone,
-            )
-            from output_paths import stage3_guided_results_file, stage3_guided_summary_file
-            out_root = config.paths.output_dir
-            save_json(result["results"], str(stage3_guided_results_file(out_root, dataset, args.backbone)))
-            save_json(result["summary"], str(stage3_guided_summary_file(out_root, dataset, args.backbone)))
-    else:
-        # 全流程
-        test_input = Path(args.test_input) if args.test_input else None
-        await pipeline.run_full_curriculum(
-            levels=args.levels,
-            backbone=args.backbone,
-            test_input=test_input,
-            concurrency=args.concurrency,
-            diff_concurrency=args.diff_concurrency,
-            stage2_concurrency=args.eval_concurrency,
-            eval_concurrency=args.eval_concurrency,
-            mining_concurrency=args.diff_concurrency,
-            skip_sampling=args.skip_sampling,
-            skip_mining=args.skip_mining,
-            start_level=args.start_level,
-        )
-
-
-if __name__ == "__main__":
-    asyncio.run(_cli_main())

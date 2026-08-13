@@ -46,7 +46,7 @@ def main() -> None:
 
     by_question: Dict[str, list] = defaultdict(list)
     for level in range(1, 5):
-        path = Path(args.stage2_root) / f"dpo_level{level}" / "01_memory_bank" / "llama_semantic_memory_bank.json"
+        path = Path(args.stage2_root) / f"level{level}" / "01_memory_bank" / "llama_semantic_memory_bank.json"
         for record in json.loads(path.read_text(encoding="utf-8")):
             validated = record.get("validated_principle")
             if not isinstance(validated, dict):

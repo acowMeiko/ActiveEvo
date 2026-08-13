@@ -24,8 +24,9 @@ sys.path.insert(0, str(ROOT_DIR))
 logger = logging.getLogger("no_learning_zone")
 
 from core.agent_pipeline import AgentPipeline
+from modules.stage2 import build_level_memory
 from core.config import Config
-from output_paths import (
+from utils.output_paths import (
     stage2_summary_file,
     stage3_guided_results_file,
     stage3_guided_summary_file,
@@ -102,7 +103,7 @@ async def main_async() -> None:
     if not args.skip_stage1:
         # If reusing existing sampling data, copy it to the expected location first
         if args.stage1_sampling_source:
-            from output_paths import stage1_unified_sampling_file
+            from utils.output_paths import stage1_unified_sampling_file
             target_path = stage1_unified_sampling_file(config.paths.output_dir, backbone)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(args.stage1_sampling_source), str(target_path))
@@ -112,7 +113,6 @@ async def main_async() -> None:
         packet_path = await pipeline.stage1_learn(
             dataset_path=dataset_path,
             concurrency=args.stage1_concurrency,
-            diff_concurrency=args.stage1_diff_concurrency,
             k_trials=args.stage1_k_trials,
             backbone=backbone,
             collect_all_samples=True,
@@ -121,14 +121,15 @@ async def main_async() -> None:
 
     # ── Stage 2 + Stage 3: iterate per level ──
     for level in args.levels:
-        dataset = f"dpo_level{level}"
+        dataset = f"level{level}"
         level_payload: Dict[str, Any] = {"dataset": dataset}
 
         if not args.skip_stage2:
-            stage2_summary = await pipeline.stage2_memorize(
-                dataset=dataset,
+            stage2_summary = await build_level_memory(
+                pipeline,
+                level=dataset,
                 round_id=level,
-                validation_concurrency=args.stage2_concurrency,
+                model_concurrency=args.stage2_concurrency,
                 backbone=backbone,
             )
             level_payload["stage2"] = stage2_summary

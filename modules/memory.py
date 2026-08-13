@@ -36,7 +36,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
+from utils.embedding_utils import DEFAULT_EMBEDDING_MODEL, allow_hash_fallback, load_sentence_transformer_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,7 @@ class Memory:
         "task_objective": str,
         "principle":  str,             # 核心经验文本
         "source_round": int,           # 来源轮次 (1/2/3/4)
-        "source_dataset": str,         # e.g. "dpo_level1"
+        "source_dataset": str,         # e.g. "level1"
         "quality_metrics": dict,       # optional
         "status": "active" | "deprecated" | "linked",
     }
@@ -189,9 +189,9 @@ class Memory:
         logger.info("Memory saved: %d principles to %s", len(self.principles), d)
 
     def snapshot(self, round_id: int, memory_dir: Optional[str] = None) -> None:
-        """按轮次保存快照到 snapshots/round_{id}/"""
+        """Save the cumulative curriculum snapshot to snapshots/level{id}/."""
         d = Path(memory_dir) if memory_dir else self.memory_dir
-        snapshot_dir = d / "snapshots" / f"round_{round_id}"
+        snapshot_dir = d / "snapshots" / f"level{round_id}"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
 
         # Save principles snapshot
@@ -214,7 +214,7 @@ class Memory:
         with open(metadata_dir / "stats.json", "w", encoding="utf-8") as f:
             json.dump(self.stats(), f, ensure_ascii=False, indent=2)
 
-        logger.info("Snapshot saved: round_%d (%d principles) → %s", round_id, len(self.principles), snapshot_dir)
+        logger.info("Snapshot saved: level%d (%d principles) → %s", round_id, len(self.principles), snapshot_dir)
 
     # ================================================================
     # Memory Write Operations
@@ -320,12 +320,19 @@ class Memory:
                 return
         logger.warning("Memory ID not found for update: %s", memory_id)
 
-    def replace_version(self, memory_id: str, replacement: Dict[str, Any], *, reason: str = "") -> None:
+    def replace_version(
+        self,
+        memory_id: str,
+        replacement: Dict[str, Any],
+        *,
+        reason: str = "",
+        operation: str = "update",
+    ) -> None:
         """Append an auditable replacement version while keeping a stable ID."""
         payload = deepcopy(replacement)
         payload.pop("memory_id", None)
         payload["status"] = payload.get("status", "active")
-        payload["operation"] = "REPLACE"
+        payload["operation"] = operation.upper()
         payload["update_reason"] = reason
         self.update(memory_id, payload)
 

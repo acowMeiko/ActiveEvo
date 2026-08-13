@@ -23,6 +23,7 @@ numpy>=1.26,<2
 scipy>=1.13,<2
 sympy>=1.14,<1.15
 faiss-cpu>=1.13,<1.14
+matplotlib>=3.9,<4
 
 # Model and embedding stack. These versions match the tested hcz environment.
 torch==2.8.0
@@ -35,8 +36,8 @@ huggingface-hub>=0.36,<0.37
 datasets>=4.0,<4.1
 fsspec[http]>=2023.1,<=2025.3.0
 
-# Local OpenAI-compatible serving and client access
-vllm==0.10.2
+# OpenAI-compatible client access. Model serving is installed separately under
+# api_call because Qwen3.5 requires a current vLLM build.
 openai>=1.100,<2
 fastapi>=0.115,<0.117
 uvicorn>=0.30,<0.36

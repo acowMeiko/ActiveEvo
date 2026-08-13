@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import math
 import re
+import signal
+import threading
+from contextlib import contextmanager
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Any, Dict, List, Optional
 
 import sympy as sp
@@ -20,6 +25,11 @@ from sympy.parsing.sympy_parser import (
 
 
 _TRANSFORMS = standard_transformations + (convert_xor, implicit_multiplication_application)
+_MAX_SYMBOLIC_INPUT_CHARS = 256
+_MAX_SYMBOLIC_OPERATORS = 64
+_MAX_SYMBOLIC_IDENTIFIERS = 8
+_MAX_NUMERIC_EXPONENT = 100
+_SYMPY_TIMEOUT_SECONDS = 0.75
 _FINAL_LINE_RE = re.compile(
     r"(?im)^\s*(?:final\s+answer|answer)\s*:\s*(.+?)\s*$"
 )
@@ -162,6 +172,66 @@ def _latex_to_sympy_text(text: str) -> str:
     return expr
 
 
+def _symbolic_input_safe(text: str) -> bool:
+    """Reject model prose and expressions capable of pathological expansion.
+
+    Exact normalized answers are accepted before this check.  SymPy is only a
+    fallback for small mathematical expressions, never a general text parser.
+    """
+    raw = _strip_wrappers(text)
+    if not raw or len(raw) > _MAX_SYMBOLIC_INPUT_CHARS:
+        return False
+    expr = _latex_to_sympy_text(raw)
+    if len(expr) > _MAX_SYMBOLIC_INPUT_CHARS:
+        return False
+    if not re.fullmatch(r"[0-9A-Za-z_+\-*/^().,\\{}=\s]*", raw):
+        return False
+    if sum(raw.count(operator) for operator in "+-*/^=") > _MAX_SYMBOLIC_OPERATORS:
+        return False
+    if raw.count("{") != raw.count("}") or raw.count("(") != raw.count(")"):
+        return False
+    identifiers = re.findall(r"[A-Za-z]+", expr)
+    allowed_words = {"pi", "sqrt", "oo", "e"}
+    if any(identifier.lower() not in allowed_words and len(identifier) != 1 for identifier in identifiers):
+        return False
+    if len(set(identifier.lower() for identifier in identifiers)) > _MAX_SYMBOLIC_IDENTIFIERS:
+        return False
+    for exponent in re.findall(r"(?:\*\*|\^)\s*\(?\s*([-+]?\d+)", expr):
+        try:
+            if abs(int(exponent)) > _MAX_NUMERIC_EXPONENT:
+                return False
+        except ValueError:
+            return False
+    # Deeply nested powers are a common source of explosive symbolic growth.
+    if expr.count("**") > 4:
+        return False
+    return True
+
+
+class _SymbolicTimeout(TimeoutError):
+    pass
+
+
+@contextmanager
+def _symbolic_timeout(seconds: float):
+    """Wall-clock guard for SymPy on the main thread (Linux deployment path)."""
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
+        yield
+        return
+    previous_handler = signal.getsignal(signal.SIGALRM)
+
+    def raise_timeout(_signum, _frame):
+        raise _SymbolicTimeout("symbolic equivalence timed out")
+
+    signal.signal(signal.SIGALRM, raise_timeout)
+    previous_timer = signal.setitimer(signal.ITIMER_REAL, max(0.01, float(seconds)))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def _parse_symbolic(text: str) -> Optional[sp.Expr]:
     try:
         return parse_expr(
@@ -170,37 +240,105 @@ def _parse_symbolic(text: str) -> Optional[sp.Expr]:
             transformations=_TRANSFORMS,
             evaluate=True,
         )
+    except _SymbolicTimeout:
+        raise
     except Exception:
         return None
 
 
-def answers_equivalent(candidate: str, expected: str) -> bool:
-    """Compare two already-extracted answer expressions."""
+def _simple_number(text: str) -> Optional[Fraction]:
+    """Parse integers, decimals and plain/LaTeX rational numbers without SymPy."""
+    value = _normalized_text(text)
+    latex_fraction = re.fullmatch(r"\\frac\{([-+]?\d+)\}\{([-+]?\d+)\}", value)
+    plain_fraction = re.fullmatch(r"([-+]?\d+)/([-+]?\d+)", value)
+    try:
+        if latex_fraction:
+            denominator = int(latex_fraction.group(2))
+            return Fraction(int(latex_fraction.group(1)), denominator) if denominator else None
+        if plain_fraction:
+            denominator = int(plain_fraction.group(2))
+            return Fraction(int(plain_fraction.group(1)), denominator) if denominator else None
+        if re.fullmatch(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)", value):
+            return Fraction(Decimal(value))
+    except (ValueError, ZeroDivisionError, InvalidOperation):
+        return None
+    return None
+
+
+def answers_equivalent_detailed(candidate: str, expected: str) -> Dict[str, Any]:
+    """Compare extracted answers and expose the safe matching decision path."""
+    decision: Dict[str, Any] = {
+        "correct": False,
+        "status": "not_matched",
+        "method": "none",
+        "reason": "",
+    }
     if not candidate or not expected:
-        return False
+        decision["reason"] = "missing_candidate_or_expected"
+        return decision
     cand_norm = _normalized_text(candidate)
     exp_norm = _normalized_text(expected)
     if cand_norm == exp_norm:
-        return True
+        return {"correct": True, "status": "matched", "method": "exact", "reason": "normalized_exact"}
 
     # Preserve exact semantics for answer labels and booleans.
     if re.fullmatch(r"\(?[a-j]\)?", cand_norm) and re.fullmatch(r"\(?[a-j]\)?", exp_norm):
-        return cand_norm.strip("()") == exp_norm.strip("()")
+        correct = cand_norm.strip("()") == exp_norm.strip("()")
+        return {"correct": correct, "status": "matched" if correct else "not_matched",
+                "method": "choice_label", "reason": ""}
     if cand_norm in {"true", "false"} or exp_norm in {"true", "false"}:
-        return cand_norm == exp_norm
+        correct = cand_norm == exp_norm
+        return {"correct": correct, "status": "matched" if correct else "not_matched",
+                "method": "boolean", "reason": ""}
 
-    cand_expr = _parse_symbolic(candidate)
-    exp_expr = _parse_symbolic(expected)
-    if cand_expr is not None and exp_expr is not None:
-        try:
+    candidate_number = _simple_number(candidate)
+    expected_number = _simple_number(expected)
+    if candidate_number is not None and expected_number is not None:
+        correct = candidate_number == expected_number
+        return {"correct": correct, "status": "matched" if correct else "not_matched",
+                "method": "numeric_fraction", "reason": ""}
+
+    unsafe = []
+    if not _symbolic_input_safe(candidate):
+        unsafe.append("candidate")
+    if not _symbolic_input_safe(expected):
+        unsafe.append("expected")
+    if unsafe:
+        return {"correct": False, "status": "symbolic_skipped", "method": "none",
+                "reason": "unsafe_symbolic_" + "_and_".join(unsafe)}
+
+    try:
+        with _symbolic_timeout(_SYMPY_TIMEOUT_SECONDS):
+            cand_expr = _parse_symbolic(candidate)
+            exp_expr = _parse_symbolic(expected)
+            if cand_expr is None or exp_expr is None:
+                return {"correct": False, "status": "not_matched", "method": "symbolic",
+                        "reason": "symbolic_parse_failed"}
+            if int(sp.count_ops(cand_expr)) > _MAX_SYMBOLIC_OPERATORS:
+                return {"correct": False, "status": "symbolic_skipped", "method": "symbolic",
+                        "reason": "candidate_operation_limit"}
+            if int(sp.count_ops(exp_expr)) > _MAX_SYMBOLIC_OPERATORS:
+                return {"correct": False, "status": "symbolic_skipped", "method": "symbolic",
+                        "reason": "expected_operation_limit"}
             difference = sp.simplify(cand_expr - exp_expr)
             if difference == 0:
-                return True
+                return {"correct": True, "status": "matched", "method": "symbolic", "reason": ""}
             if not difference.free_symbols:
-                return abs(float(sp.N(difference, 15))) <= 1e-9
-        except (TypeError, ValueError, ArithmeticError):
-            pass
-    return False
+                correct = abs(float(sp.N(difference, 15))) <= 1e-9
+                return {"correct": correct, "status": "matched" if correct else "not_matched",
+                        "method": "symbolic_numeric", "reason": ""}
+    except _SymbolicTimeout:
+        return {"correct": False, "status": "symbolic_timeout", "method": "symbolic",
+                "reason": f"exceeded_{_SYMPY_TIMEOUT_SECONDS}_seconds"}
+    except (TypeError, ValueError, ArithmeticError, MemoryError, RecursionError) as exc:
+        return {"correct": False, "status": "symbolic_skipped", "method": "symbolic",
+                "reason": type(exc).__name__}
+    return decision
+
+
+def answers_equivalent(candidate: str, expected: str) -> bool:
+    """Compatibility boolean wrapper around the auditable matcher."""
+    return bool(answers_equivalent_detailed(candidate, expected)["correct"])
 
 
 def evaluate_svamp(generated: str, gold_answer: str) -> bool:
@@ -240,6 +378,17 @@ def check_answer(generated: str, expected: str) -> bool:
     candidate = extract_final_answer(generated)
     expected_value = extract_final_answer(expected) or _strip_wrappers(expected)
     return bool(candidate and expected_value) and answers_equivalent(candidate, expected_value)
+
+
+def check_answer_detailed(generated: str, expected: str) -> Dict[str, Any]:
+    """Strict match with extraction and a persisted audit reason."""
+    candidate = extract_final_answer(generated)
+    expected_value = extract_final_answer(expected) or _strip_wrappers(expected)
+    if not candidate:
+        return {"correct": False, "status": "not_matched", "method": "extraction",
+                "reason": "missing_explicit_final_answer", "candidate": None}
+    decision = answers_equivalent_detailed(candidate, expected_value)
+    return {**decision, "candidate": candidate}
 
 
 def check_answer_for_item(generated: str, item: Dict[str, Any]) -> bool:

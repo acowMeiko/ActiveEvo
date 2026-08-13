@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
-DATASETS = ["dpo_level1", "dpo_level2", "dpo_level3", "dpo_level4"]
+DATASETS = ["level1", "level2", "level3", "level4"]
 
 
 def load_json(path: Path) -> Any:

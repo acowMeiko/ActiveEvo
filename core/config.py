@@ -7,7 +7,7 @@ from datetime import datetime
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 
 
 # Local deployments may choose any unprivileged TCP port. The deployment
@@ -98,19 +98,15 @@ class PathConfig:
     """路径配置"""
     project_root: Path
     data_dir_name: str = "data"
-    dpo_dir_name: str = "dpo_data"  # 与实际 data/dpo_data/ 目录一致
     memory_dir_name: str = "memory_data"
     test_dir_name: str = "test"
     output_dir_name: str = "output"
     checkpoint_dir_name: str = "checkpoints"
+    models_dir_name: str = "models"
     
     @property
     def data_dir(self) -> Path:
         return self.project_root / self.data_dir_name
-    
-    @property
-    def dpo_dir(self) -> Path:
-        return self.data_dir / self.dpo_dir_name
     
     @property
     def memory_dir(self) -> Path:
@@ -131,6 +127,27 @@ class PathConfig:
     @property
     def checkpoint_dir(self) -> Path:
         return self.project_root / self.checkpoint_dir_name
+
+    @property
+    def models_dir(self) -> Path:
+        """Role-based model mount point; model weights are never committed."""
+        return self.project_root / self.models_dir_name
+
+    @property
+    def actor_model_dir(self) -> Path:
+        return self.models_dir / "actor"
+
+    @property
+    def generator_model_dir(self) -> Path:
+        return self.models_dir / "generator"
+
+    @property
+    def auditor_model_dir(self) -> Path:
+        return self.models_dir / "auditor"
+
+    @property
+    def embedding_model_dir(self) -> Path:
+        return self.models_dir / "embedding"
     
     @property
     def memory_file(self) -> Path:
@@ -151,11 +168,17 @@ class PathConfig:
     def ensure_dirs(self) -> None:
         """创建所有必需的目录"""
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.dpo_dir.mkdir(parents=True, exist_ok=True)
         self.memory_dir.mkdir(parents=True, exist_ok=True)
         self.test_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        for model_dir in (
+            self.actor_model_dir,
+            self.generator_model_dir,
+            self.auditor_model_dir,
+            self.embedding_model_dir,
+        ):
+            model_dir.mkdir(parents=True, exist_ok=True)
 
 
 # ==================== 全局常量 ====================
@@ -178,7 +201,6 @@ class HyperParamsConfig:
       1. weak_model_name 与 deploy.conf / active_deployment.env 中模型名一致
       2. weak_model_url 端口与 active_deployment.env 中实际端口一致
       3. 本地 vLLM 由 api_call/run.sh 启动，ActiveEvo 只负责调用其 API
-      4. Step 1 需要 strong model, 请务必填写 strong_model_* 三项
     """
 
     # === 1. 弱模型 (本地 vLLM，由 api_call 模块部署) ===
@@ -190,27 +212,9 @@ class HyperParamsConfig:
     weak_model_key: str = os.environ.get("ACTIVEEVO_WEAK_MODEL_API_KEY", "EMPTY")
     weak_timeout: int = 180
 
-    # === 2. 强模型 (外部 API) ===
-    # Step 1 必须配置强模型！Step 2/3 仅用弱模型也可运行
-    # 示例: "deepseek-chat", "deepseek-reasoner", "claude-sonnet-4-20250514"
-    # 本地测试时不使用强模型，全程走本地 vLLM
-    strong_model_name: str = os.environ.get("ACTIVEEVO_STRONG_MODEL", "deepseek-reasoner")
-    
-    # 示例: "https://api.deepseek.com/v1/chat/completions"
-    strong_model_url: str = os.environ.get(
-        "ACTIVEEVO_STRONG_MODEL_URL", "https://api.deepseek.com/v1/chat/completions"
-    )
-    
-    # Never hard-code credentials. Export ACTIVEEVO_STRONG_MODEL_API_KEY when
-    # Stage 1 is configured to use an external model.
-    strong_model_key: str = os.environ.get("ACTIVEEVO_STRONG_MODEL_API_KEY", "")
-
     # 通用参数
     temperature: float = 0.7
     max_tokens: int = 7500
-    # 强模型单独 max_tokens（弱模型继续使用 max_tokens，不受此项影响）
-    strong_max_tokens: int = 6144
-    strong_timeout: int = 240
     top_p: float = 0.95
     
     # 推理相关
@@ -225,6 +229,70 @@ class HyperParamsConfig:
     faiss_hard_threshold: float = 0.8 # 一票否决硬性及格线
     faiss_model_name: str = 'all-MiniLM-L6-v2' # 极速轻量级 Embedding 模型
 
+
+@dataclass(frozen=True)
+class PipelineConfig:
+    """User-facing pipeline defaults.
+
+    Deployment remains in api_call/. The pipeline only reads endpoint ports and
+    controls Stage 1/2/3 experiment flow.
+    """
+
+    public_levels: Tuple[str, ...] = ("level1", "level2", "level3", "level4")
+    default_ports: Tuple[int, ...] = (8100, 8101, 8102, 8103)
+    default_model: str = "llama"
+    default_backbone: str = "default"
+    default_memory_dir: str = "memory/store"
+    default_test_file: str = "data/test/deepscaler.json"
+    default_temperature: float = 0.2
+    default_pass_k: int = 3
+    default_seeds: Tuple[int, ...] = (42, 43, 44)
+    stage1_dataset_path: str = ""
+    stage1_expected_dataset_sha256: str = "9d8b634043cb008076cbf60b7c8a01fddaeb2a83f9d3a8de564b05dd176eb225"
+    stage1_expected_dataset_size: int = 6000
+    stage1_k_trials: int = 10
+    stage1_experiment_seed: int = 42
+    stage1_temperature: float = 0.7
+    stage1_top_p: float = 0.95
+    stage1_top_logprobs: int = 5
+    stage1_entropy_histogram_bins: int = 20
+    stage1_max_tokens: int = 4096
+    stage1_disable_early_stop: bool = True
+    stage1_concurrency: int = 16
+    stage1_task_batch_size: int = 1000
+    stage2_concurrency: int = 8
+    stage3_concurrency: int = 8
+    stage3_threshold: float = 0.55
+    stage3_candidate_top_k: int = 12
+    stage3_gate_top_k: int = 6
+    stage3_max_injected: int = 1
+    embedding_device: str = "cpu"
+    embedding_model: str = "BAAI/bge-m3"
+    force_embedding: str = "1"
+    allow_hash_fallback: str = "0"
+    request_timeout: int = 600
+
+
+@dataclass(frozen=True)
+class Stage2Config:
+    """Memory Factory defaults, independent from Stage-3 evaluation."""
+
+    max_principles_per_question: int = 3
+    reconciliation_top_k: int = 5
+    generation_max_tokens: int = 3072
+    audit_max_tokens: int = 2048
+    validation_seed: int = 42
+    generator_model: str = os.environ.get("ACTIVEEVO_GENERATOR_MODEL", "deepseek-v4-pro")
+    generator_url: str = os.environ.get(
+        "ACTIVEEVO_GENERATOR_URL", "https://api.deepseek.com/v1/chat/completions"
+    )
+    generator_key_env: str = "ACTIVEEVO_GENERATOR_API_KEY"
+    auditor_model: str = os.environ.get("ACTIVEEVO_AUDITOR_MODEL", "qwen")
+    auditor_url: str = os.environ.get(
+        "ACTIVEEVO_AUDITOR_URL", "http://localhost:8200/v1/chat/completions"
+    )
+    auditor_key_env: str = "ACTIVEEVO_AUDITOR_API_KEY"
+
 @dataclass(frozen=True)
 class Config:
     """主配置类，整合所有子配置"""
@@ -232,6 +300,8 @@ class Config:
     log: LogConfig = field(default_factory=lambda: None)
     paths: PathConfig = field(default_factory=lambda: None)
     hyperparams: HyperParamsConfig = field(default_factory=lambda: None)
+    pipeline: PipelineConfig = field(default_factory=lambda: None)
+    stage2: Stage2Config = field(default_factory=lambda: None)
     
     @classmethod
     def from_core_file(cls) -> "Config":
@@ -241,12 +311,16 @@ class Config:
         log_config = LogConfig(project_root=project_root)
         path_config = PathConfig(project_root=project_root)
         hyperparam_config = HyperParamsConfig()
+        pipeline_config = PipelineConfig()
+        stage2_config = Stage2Config()
         
         return cls(
             project_root=project_root,
             log=log_config,
             paths=path_config,
-            hyperparams=hyperparam_config
+            hyperparams=hyperparam_config,
+            pipeline=pipeline_config,
+            stage2=stage2_config,
         )
     
     def ensure_dirs(self) -> None:
