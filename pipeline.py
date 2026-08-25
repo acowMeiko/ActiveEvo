@@ -20,7 +20,37 @@ from pathlib import Path
 from core.agent_pipeline import AgentPipeline
 from core.config import Config
 from modules.memory_module import MemoryModule
-from modules.stage2 import build_level_memory
+from modules.stage2 import (
+    build_level_memory,
+    compare_pilot_branches,
+    compare_generators,
+    evaluate_dev8_gate,
+    pilot_status,
+    prepare_pilot_manifest,
+    run_qwen_protocol_probe,
+    run_generator_pilot,
+    validate_source_principles,
+    freeze_stage2_round,
+    incremental_registry_status,
+    prepare_incremental_target,
+    run_incremental_candidate_round,
+    build_principle_test_report,
+    generate_raw_candidates,
+    generate_variants,
+    prepare_principle_test,
+    principle_test_status,
+    require_variant_approvals,
+    run_audit_ablation,
+    run_principle_test_smoke,
+    run_provider_probe,
+    run_robustness_effect_test,
+    run_source_effect_test,
+    run_transfer_effect_test,
+    run_kimi_synthesis_recovery,
+    run_role_compare,
+    prepare_l23_protocol,
+    run_l23_protocol_calibration,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -99,12 +129,26 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     stage1.add_argument("--expected-dataset-sha256", default=defaults.stage1_expected_dataset_sha256)
     stage1.add_argument("--expected-dataset-size", type=int, default=defaults.stage1_expected_dataset_size)
     stage1.add_argument("--k-trials", type=int, default=defaults.stage1_k_trials)
+    stage1.add_argument(
+        "--panic-max-correct", type=int, default=defaults.stage1_panic_max_correct,
+        help="Largest correct@K count assigned to Panic Zone.",
+    )
+    stage1.add_argument(
+        "--master-min-correct", type=int, default=defaults.stage1_master_min_correct,
+        help="Smallest correct@K count assigned to Master Zone.",
+    )
     stage1.add_argument("--experiment-seed", type=int, default=defaults.stage1_experiment_seed)
     stage1.add_argument("--temperature", type=float, default=defaults.stage1_temperature)
     stage1.add_argument("--top-p", type=float, default=defaults.stage1_top_p)
     stage1.add_argument("--top-logprobs", type=int, default=defaults.stage1_top_logprobs)
     stage1.add_argument("--entropy-histogram-bins", type=int, default=defaults.stage1_entropy_histogram_bins)
     stage1.add_argument("--max-tokens", type=int, default=defaults.stage1_max_tokens)
+    stage1.add_argument(
+        "--finalizer-max-tokens", type=int, default=defaults.stage1_finalizer_max_tokens,
+    )
+    stage1.add_argument(
+        "--finalizer-timeout", type=int, default=defaults.stage1_finalizer_timeout,
+    )
     stage1.add_argument("--backbone", default=defaults.default_backbone)
     stage1.add_argument("--concurrency", type=int, default=defaults.stage1_concurrency)
     stage1.add_argument("--task-batch-size", type=int, default=defaults.stage1_task_batch_size)
@@ -113,7 +157,20 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     _add_common_runtime_args(stage1, config)
 
     stage2 = subparsers.add_parser("stage2", help="Generate and quality-audit memories.")
+    stage2.add_argument(
+        "--mode", choices=[
+            "build", "validate-source", "probe-qwen", "compare-generators",
+            "prepare-pilot", "pilot-run", "pilot-status", "pilot-compare",
+            "principle-test",
+            "incremental",
+        ], default="build",
+        help="Build Memory candidates or run source-question Principle validation.",
+    )
     stage2.add_argument("--level", default="level1", type=_public_level, choices=list(defaults.public_levels))
+    stage2.add_argument(
+        "--generator", choices=["deepseek", "qwen"], default="deepseek",
+        help="Stage-2 Principle generator. The auditor remains independently configured.",
+    )
     stage2.add_argument("--memory-dir", default=defaults.default_memory_dir)
     stage2.add_argument("--backbone", default=defaults.default_backbone)
     stage2.add_argument("--model-concurrency", type=int, default=defaults.stage2_concurrency)
@@ -123,6 +180,99 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     stage2.add_argument("--candidate-bank", default="", help="Frozen candidate bank JSON.")
     stage2.add_argument("--selection-file", default="", help="Stable sampled question IDs.")
     stage2.add_argument("--output-dir", default="", help="Stage 2 audit artifact directory.")
+    stage2.add_argument(
+        "--candidate-artifact-root", default="",
+        help="Stage 2 artifact root containing candidate_banks/ and per-level learning bundles.",
+    )
+    stage2.add_argument(
+        "--validation-output-dir", default="",
+        help="Read-only source-validation output directory.",
+    )
+    stage2.add_argument(
+        "--validation-concurrency", type=int,
+        default=defaults.stage2_source_validation_concurrency,
+    )
+    stage2.add_argument(
+        "--validation-seeds", type=int, nargs="+",
+        default=list(defaults.stage2_source_validation_seeds),
+    )
+    stage2.add_argument(
+        "--validation-temperatures", type=float, nargs="+",
+        default=list(defaults.stage2_source_validation_temperatures),
+    )
+    stage2.add_argument("--expected-candidates", type=int, default=0)
+    stage2.add_argument("--expected-questions", type=int, default=0)
+    stage2.add_argument("--deepseek-artifact-root", default="")
+    stage2.add_argument("--qwen-artifact-root", default="")
+    stage2.add_argument("--deepseek-validation-dir", default="")
+    stage2.add_argument("--qwen-validation-dir", default="")
+    stage2.add_argument(
+        "--pilot-root",
+        default="output/stage2/generator_comparison/pilot100_v2",
+        help="Shared root for the recoverable DeepSeek/Qwen 100-question pilot.",
+    )
+    stage2.add_argument(
+        "--pilot-dev-manifest",
+        default="output/stage2/generator_comparison/manifests/dev8.json",
+        help="Frozen two-question-per-level development manifest.",
+    )
+    stage2.add_argument(
+        "--pilot-phase", choices=["dev8", "remaining92", "all100"], default="dev8",
+    )
+    stage2.add_argument("--pilot-concurrency", type=int, default=2)
+    stage2.add_argument("--pilot-seed", type=int, default=42)
+    stage2.add_argument("--retry-terminal", action="store_true")
+    stage2.add_argument(
+        "--test-phase",
+        choices=[
+            "prepare", "probe", "smoke", "variants", "generate", "audit",
+            "source", "transfer", "robustness", "report", "status",
+            "role-compare", "kimi-synthesis-recovery", "protocol-prepare", "protocol-run",
+        ],
+        default="status",
+        help="Phase of the isolated 40-source/40-variant Principle test.",
+    )
+    stage2.add_argument(
+        "--test-root", default="output/stage2/principle_test_80_v1",
+        help="Artifact root for the isolated Principle test; never a Memory Store.",
+    )
+    stage2.add_argument(
+        "--protocol-exclude-root", action="append", default=[],
+        help=(
+            "Earlier protocol-calibration root whose frozen source questions "
+            "must be excluded. Repeat this option for multiple prior rounds."
+        ),
+    )
+    stage2.add_argument("--resume", action="store_true", help="Reuse hash-compatible completed artifacts.")
+    stage2.add_argument(
+        "--incremental-phase", choices=["prepare", "run", "freeze", "status"],
+        default="status", help="Manage append-only Stage-2 target rounds.",
+    )
+    stage2.add_argument(
+        "--target-size", default="40",
+        help="Nested Stage-2 target: 40, 100, 600, or all.",
+    )
+    stage2.add_argument(
+        "--registry-root", default="output/stage2/candidate_registry",
+        help="Global per-question Candidate Registry.",
+    )
+    stage2.add_argument(
+        "--incremental-workspace", default="output/stage2/incremental",
+        help="Target manifests and cumulative Candidate Banks.",
+    )
+    stage2.add_argument(
+        "--stage2-state-root", default="state/stage2",
+        help="Durable protocol locks and immutable release manifests.",
+    )
+    stage2.add_argument(
+        "--incremental-target-root", default="",
+        help="Explicit completed round root used by incremental freeze.",
+    )
+    stage2.add_argument(
+        "--quality-decision", default="",
+        help="Round quality JSON with approved=true; calibration report is used when omitted.",
+    )
+    _add_common_runtime_args(stage2, config)
 
     stage3 = subparsers.add_parser("stage3", help="Evaluate baseline or memory-guided solving.")
     stage3.add_argument("--variant", choices=["baseline", "guided"], default="guided")
@@ -189,8 +339,8 @@ def validate_stage1_inputs(args: argparse.Namespace) -> None:
         )
     if args.skip_sampling:
         return
-    if len(args.ports) != 4:
-        raise ValueError(f"Stage 1 expects exactly four actor endpoints; got ports={args.ports}")
+    if not args.ports:
+        raise ValueError("Stage 1 requires at least one actor endpoint")
     from modules.execute_module import is_url_reachable
     dead = [port for port in args.ports if not is_url_reachable(f"http://127.0.0.1:{port}")]
     if dead:
@@ -199,18 +349,28 @@ def validate_stage1_inputs(args: argparse.Namespace) -> None:
 
 async def run_stage1(args: argparse.Namespace, config: Config) -> None:
     validate_stage1_inputs(args)
+    if not 0 <= args.panic_max_correct < args.master_min_correct <= args.k_trials:
+        raise ValueError(
+            "Stage 1 zone thresholds must satisfy "
+            f"0 <= panic_max_correct < master_min_correct <= k_trials; got "
+            f"{args.panic_max_correct}, {args.master_min_correct}, {args.k_trials}"
+        )
     pipeline = build_agent_pipeline(args, config)
     logger.info("Stage 1 started: sampling once and producing level1-level4 learning bundles")
     await pipeline.stage1_learn(
         dataset_path=args.dataset,
         concurrency=args.concurrency,
         k_trials=args.k_trials,
+        panic_max_correct=args.panic_max_correct,
+        master_min_correct=args.master_min_correct,
         experiment_seed=args.experiment_seed,
         temperature=args.temperature,
         top_p=args.top_p,
         top_logprobs=args.top_logprobs,
         entropy_histogram_bins=args.entropy_histogram_bins,
         max_tokens=args.max_tokens,
+        finalizer_max_tokens=args.finalizer_max_tokens,
+        finalizer_timeout=args.finalizer_timeout,
         task_batch_size=args.task_batch_size,
         expected_dataset_sha256=args.expected_dataset_sha256,
         expected_dataset_size=args.expected_dataset_size,
@@ -222,6 +382,287 @@ async def run_stage1(args: argparse.Namespace, config: Config) -> None:
 
 
 async def run_stage2(args: argparse.Namespace, config: Config) -> None:
+    if args.mode == "incremental":
+        target: int | str = (
+            "all" if str(args.target_size).lower() == "all" else int(args.target_size)
+        )
+        registry_root = Path(args.registry_root)
+        workspace_root = Path(args.incremental_workspace)
+        state_root = Path(args.stage2_state_root)
+        phase = args.incremental_phase
+        incremental_phase_zh = {
+            "prepare": "计算可复用题目与新增题目",
+            "run": "只生成并审查本轮缺失题目",
+            "freeze": "质量确认后冻结本轮结果",
+            "status": "查看长期冻结状态",
+        }.get(phase, phase)
+        logger.info(
+            "Stage 2增量流程：操作=%s（%s），目标规模=%s，backbone=%s",
+            incremental_phase_zh, phase, target, args.backbone,
+        )
+        if phase == "status":
+            result = incremental_registry_status(
+                registry_root=registry_root,
+                state_root=state_root,
+                workspace_root=workspace_root,
+            )
+        elif phase == "prepare":
+            lock_path = state_root / "current_protocol.lock.json"
+            if not lock_path.exists():
+                raise RuntimeError(
+                    "No frozen Stage-2 protocol. Finish and freeze the 40-question calibration first."
+                )
+            result = prepare_incremental_target(
+                config, target=target, workspace_root=workspace_root,
+                registry_root=registry_root, backbone=args.backbone,
+                seed=config.stage2.principle_test_seed,
+                protocol=json.loads(lock_path.read_text(encoding="utf-8")),
+            )
+        elif phase == "run":
+            result = await run_incremental_candidate_round(
+                config, target=target, workspace_root=workspace_root,
+                registry_root=registry_root, state_root=state_root,
+                backbone=args.backbone, concurrency=args.model_concurrency,
+            )
+        else:
+            if str(target).lower() == "all":
+                if not args.incremental_target_root:
+                    raise ValueError("Freezing target=all requires --incremental-target-root")
+                target_root = Path(args.incremental_target_root)
+                manifest = json.loads(
+                    (target_root / "manifests" / "source40.json").read_text(encoding="utf-8")
+                )
+                target_count = len(manifest.get("source_question_ids", []))
+            else:
+                target_count = int(target)
+                target_root = (
+                    Path(args.incremental_target_root) if args.incremental_target_root else
+                    workspace_root / f"target_{target_count:04d}"
+                )
+            result = freeze_stage2_round(
+                config, target_root=target_root, registry_root=registry_root,
+                state_root=state_root, target_count=target_count,
+                quality_decision_path=(Path(args.quality_decision) if args.quality_decision else None),
+            )
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+    if args.mode == "principle-test":
+        root = Path(args.test_root)
+        phase = args.test_phase
+        phase_zh = {
+            "prepare": "准备并冻结40道来源题清单",
+            "probe": "远程模型接口探针",
+            "smoke": "8题最小流程测试",
+            "variants": "生成并验算40道结构变式题",
+            "generate": "生成40道来源题的Principle",
+            "audit": "比较三种质量审查协议",
+            "source": "来源题纠偏效果与介入方式测试",
+            "transfer": "结构变式题迁移测试",
+            "robustness": "温度稳健性测试",
+            "report": "生成最终验收报告",
+            "status": "查看当前测试状态",
+            "role-compare": "8题双生成器交叉审查与Llama配对验证",
+            "kimi-synthesis-recovery": "仅恢复4道Kimi合成截断题",
+            "protocol-prepare": "冻结全新Level 2/3共20道协议校准题",
+            "protocol-run": "DeepSeek生成、Kimi六维审查与Llama配对验证",
+        }.get(phase, phase)
+        logger.info(
+            "Stage 2 Principle测试：阶段=%s（%s），结果目录=%s，backbone=%s，模型=%s，"
+            "端口=%s，生成并发=%d，验证并发=%d",
+            phase_zh, phase, root, args.backbone, args.model, ",".join(map(str, args.ports)),
+            args.model_concurrency, args.validation_concurrency,
+        )
+        if phase == "prepare":
+            result = prepare_principle_test(
+                config, test_root=root, backbone=args.backbone,
+                sources_per_level=config.stage2.principle_test_sources_per_level,
+                reserve_per_level=config.stage2.principle_test_reserve_per_level,
+                seed=config.stage2.principle_test_seed,
+            )
+        elif phase == "probe":
+            result = await run_provider_probe(config, test_root=root, repeats=3)
+        elif phase == "smoke":
+            result = await run_principle_test_smoke(
+                config, test_root=root, backbone=args.backbone,
+                ports=args.ports, model=args.model,
+                concurrency=args.validation_concurrency, timeout=args.timeout,
+            )
+        elif phase == "variants":
+            result = await generate_variants(
+                config, test_root=root, concurrency=args.model_concurrency,
+            )
+        elif phase == "generate":
+            require_variant_approvals(root)
+            result = await generate_raw_candidates(
+                config, test_root=root, concurrency=args.model_concurrency,
+            )
+        elif phase == "audit":
+            result = await run_audit_ablation(
+                config, test_root=root, concurrency=args.model_concurrency,
+            )
+        elif phase == "source":
+            result = await run_source_effect_test(
+                config, test_root=root, ports=args.ports, model=args.model,
+                concurrency=args.validation_concurrency, timeout=args.timeout,
+            )
+        elif phase == "transfer":
+            result = await run_transfer_effect_test(
+                config, test_root=root, ports=args.ports, model=args.model,
+                concurrency=args.validation_concurrency, timeout=args.timeout,
+            )
+        elif phase == "robustness":
+            result = await run_robustness_effect_test(
+                config, test_root=root, ports=args.ports, model=args.model,
+                concurrency=args.validation_concurrency, timeout=args.timeout,
+            )
+        elif phase == "role-compare":
+            result = await run_role_compare(
+                config, test_root=root, ports=args.ports, model=args.model,
+                model_concurrency=args.model_concurrency,
+                validation_concurrency=args.validation_concurrency,
+                timeout=args.timeout, resume=args.resume,
+            )
+        elif phase == "kimi-synthesis-recovery":
+            result = await run_kimi_synthesis_recovery(
+                config, test_root=root, resume=args.resume,
+            )
+        elif phase == "protocol-prepare":
+            result = prepare_l23_protocol(
+                config, test_root=root, backbone=args.backbone,
+                exclude_protocol_roots=[
+                    Path(value) for value in args.protocol_exclude_root
+                ],
+            )
+        elif phase == "protocol-run":
+            result = await run_l23_protocol_calibration(
+                config, test_root=root, ports=args.ports, model=args.model,
+                generation_concurrency=args.model_concurrency,
+                validation_concurrency=args.validation_concurrency,
+                timeout=args.timeout,
+            )
+        elif phase == "report":
+            result = build_principle_test_report(root)
+        else:
+            result = principle_test_status(root)
+        print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+        return
+    if args.mode in {"prepare-pilot", "pilot-run", "pilot-status", "pilot-compare"}:
+        pilot_root = Path(args.pilot_root)
+        if args.mode == "prepare-pilot":
+            manifest = prepare_pilot_manifest(
+                config,
+                output_root=pilot_root,
+                dev_manifest_path=Path(args.pilot_dev_manifest),
+                backbone=args.backbone,
+                per_level=25,
+                seed=args.pilot_seed,
+            )
+            logger.info(
+                "Frozen pilot manifest created: questions=%d hash=%s path=%s",
+                manifest["actual_count"], manifest["manifest_hash"], pilot_root,
+            )
+            return
+        if not (pilot_root / "sample_manifest.json").exists():
+            prepare_pilot_manifest(
+                config,
+                output_root=pilot_root,
+                dev_manifest_path=Path(args.pilot_dev_manifest),
+                backbone=args.backbone,
+                per_level=25,
+                seed=args.pilot_seed,
+            )
+        if args.mode == "pilot-status":
+            print(json.dumps(pilot_status(pilot_root), ensure_ascii=False, indent=2))
+            return
+        if args.mode == "pilot-compare":
+            result = compare_pilot_branches(pilot_root)
+            logger.info("Paired generator report written: %s", pilot_root / "comparison")
+            print(json.dumps({
+                "manifest_hash": result["manifest_hash"],
+                "winner_selected": result["winner_selected"],
+            }, ensure_ascii=False, indent=2))
+            return
+        if args.generator == "qwen" and args.pilot_phase == "dev8":
+            probe_dir = pilot_root / "qwen_protocol_probe"
+            probe = await run_qwen_protocol_probe(config, output_dir=probe_dir, repeats=3)
+            if not probe["all_passed"]:
+                raise RuntimeError(f"Qwen thinking protocol probe failed: {probe}")
+        result = await run_generator_pilot(
+            config,
+            output_root=pilot_root,
+            generator_id=args.generator,
+            phase=args.pilot_phase,
+            concurrency=args.pilot_concurrency,
+            retry_terminal=args.retry_terminal,
+        )
+        logger.info(
+            "Generator pilot phase completed: generator=%s phase=%s terminal=%s/%s",
+            args.generator, args.pilot_phase,
+            result["phase_terminal_count"], result["phase_question_count"],
+        )
+        if args.pilot_phase == "dev8":
+            gate = evaluate_dev8_gate(pilot_root, args.generator)
+            print(json.dumps(gate, ensure_ascii=False, indent=2))
+            if not gate["passed"]:
+                raise RuntimeError(f"Development gate failed: {gate['reasons']}")
+        return
+    if args.mode == "probe-qwen":
+        output_dir = Path(args.output_dir or "output/stage2/generator_comparison/qwen_protocol_probe")
+        summary = await run_qwen_protocol_probe(config, output_dir=output_dir, repeats=3)
+        if not summary["all_passed"]:
+            raise RuntimeError(f"Qwen thinking protocol probe failed: {summary}")
+        logger.info("Qwen thinking protocol probe passed: %s", output_dir)
+        return
+    if args.mode == "compare-generators":
+        required = {
+            "--deepseek-artifact-root": args.deepseek_artifact_root,
+            "--qwen-artifact-root": args.qwen_artifact_root,
+            "--output-dir": args.output_dir,
+        }
+        missing = [name for name, value in required.items() if not value]
+        if missing:
+            raise ValueError(f"stage2 compare-generators missing: {', '.join(missing)}")
+        result = compare_generators(
+            deepseek_root=Path(args.deepseek_artifact_root),
+            qwen_root=Path(args.qwen_artifact_root),
+            output_dir=Path(args.output_dir),
+            deepseek_validation=(
+                Path(args.deepseek_validation_dir) if args.deepseek_validation_dir else None
+            ),
+            qwen_validation=(
+                Path(args.qwen_validation_dir) if args.qwen_validation_dir else None
+            ),
+        )
+        logger.info(
+            "Stage 2 generator comparison completed: winner=%s output=%s",
+            result.get("winner") or "not_selected",
+            args.output_dir,
+        )
+        return
+    if args.mode == "validate-source":
+        if not args.candidate_artifact_root:
+            raise ValueError("stage2 --mode validate-source requires --candidate-artifact-root")
+        artifact_root = Path(args.candidate_artifact_root)
+        validation_output = (
+            Path(args.validation_output_dir)
+            if args.validation_output_dir else
+            artifact_root / "source_validation_llama10"
+        )
+        await validate_source_principles(
+            config,
+            artifact_root=artifact_root,
+            output_dir=validation_output,
+            ports=args.ports,
+            model=args.model,
+            seeds=tuple(args.validation_seeds),
+            temperatures=tuple(args.validation_temperatures),
+            concurrency=args.validation_concurrency,
+            timeout=args.timeout,
+            expected_candidates=args.expected_candidates,
+            expected_questions=args.expected_questions,
+        )
+        logger.info("Stage 2 source validation completed: %s", validation_output)
+        return
     runtime = SimpleNamespace(
         config=config,
         memory=MemoryModule(config, memory_dir=args.memory_dir),
@@ -230,7 +671,7 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
     round_id = _level_number(level)
     dataset = level
     logger.info("Stage 2 Memory Factory started: %s", level)
-    await build_level_memory(
+    summary = await build_level_memory(
         runtime,
         level=dataset,
         round_id=round_id,
@@ -242,7 +683,14 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
         candidate_bank=args.candidate_bank,
         selection_file=args.selection_file,
         artifact_dir=args.output_dir,
+        generator_id=args.generator,
     )
+    if summary.get("status") == "empty_stage1":
+        raise FileNotFoundError(
+            "Stage 2 found no Stage-1 packets. "
+            f"Resolved path: {summary.get('packet_path')}. "
+            "Set --backbone to the Stage-1 output subdirectory (for example: --backbone llama)."
+        )
     logger.info("Stage 2 completed: %s", level)
 
 
@@ -319,6 +767,8 @@ async def run_all(args: argparse.Namespace, config: Config) -> None:
     for level in levels:
         stage2_args = argparse.Namespace(
             command="stage2",
+            mode="build",
+            generator="deepseek",
             level=level,
             memory_dir=args.memory_dir,
             backbone=config.pipeline.default_backbone,

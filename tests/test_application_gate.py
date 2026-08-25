@@ -18,6 +18,7 @@ def _candidate():
             "generalization_level": "family",
             "scope": "Fixed-width consecutive-number lattices.",
             "failure_mode": "Transferring a fixed-width formula to another recurrence.",
+            "failure_signals": ["The draft uses a fixed-width indexing formula without deriving the current row rule."],
         },
         "source_item": {
             "question": "Each row contains five consecutive integers. Find row nine.",
@@ -97,6 +98,37 @@ def test_adapter_runs_only_after_acceptance_and_keeps_audit_text():
     assert len(calls) == 1
 
 
+def test_adapter_losslessly_normalizes_action_and_verification_string_lists():
+    plan = PlanModule.__new__(PlanModule)
+
+    async def fake_call(self, prompt, **kwargs):
+        return json.dumps({
+            "status": "use",
+            "when_to_consider": "Use when a fixed row-size rule is observable.",
+            "evidence_found": [{
+                "requirement": "The row-size rule is observable.",
+                "problem_fact": "The current question states five entries per row.",
+            }],
+            "do_not_use_if": "Ignore when row width varies.",
+            "failure_to_avoid": "Avoid transferring an unverified row formula.",
+            "suggested_action": ["Derive the row boundary.", "Compute the offset."],
+            "verification": ["Check the row boundary.", "Check the target lies in the row."],
+            "reason": "All required current facts are present.",
+        })
+
+    plan._call_llm = MethodType(fake_call, plan)
+    result = asyncio.run(plan.adapt_memory_for_question(
+        "Each row has five entries.", _candidate(), {"accepted": True}
+    ))
+    assert result["status"] == "use"
+    assert result["schema_errors"] == []
+    assert result["condition_card"]["suggested_action"] == "Derive the row boundary. Compute the offset."
+    assert result["condition_card"]["verification"] == "Check the row boundary. Check the target lies in the row."
+    assert result["format_normalizations"] == [
+        "suggested_action:list_str_to_string", "verification:list_str_to_string"
+    ]
+
+
 def test_application_gate_normalizes_direct_list_without_calling_it_strictly_compliant():
     plan = PlanModule.__new__(PlanModule)
 
@@ -136,3 +168,34 @@ def test_gate_parser_preserves_full_batched_list_before_trailing_explanation():
     parsed, stage = plan._extract_gate_json(response)
     assert stage == "direct_list_normalized"
     assert [item["memory_id"] for item in parsed["judgments"]] == ["m1", "m2", "m3"]
+
+
+def test_application_gate_accepts_lossless_fenced_object_normalization():
+    plan = PlanModule.__new__(PlanModule)
+
+    async def fake_call(self, prompt, **kwargs):
+        payload = {
+            "judgments": [{
+                "memory_id": "m1",
+                "trigger_match": True,
+                "required_evidence_match": True,
+                "structural_match": True,
+                "scope_match": True,
+                "contraindicated": False,
+                "violated_conditions": [],
+                "source_specific_elements": [],
+                "confidence": 0.93,
+                "reason": "All required current-problem structure is present.",
+            }]
+        }
+        return "```json\n" + json.dumps(payload) + "\n```\nExplanation omitted by normalization."
+
+    plan._call_llm = MethodType(fake_call, plan)
+    result = asyncio.run(plan.judge_memory_applicability(
+        "Each row has a fixed width.", [_candidate()], confidence_threshold=0.8
+    ))
+    assert result["protocol_compliant"]
+    assert result["format_normalized"]
+    assert not result["strict_wire_format"]
+    assert result["parse_stage"] == "wrapped_object_normalized"
+    assert result["selected_ids"] == ["m1"]

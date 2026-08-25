@@ -19,13 +19,31 @@ from tqdm.asyncio import tqdm as async_tqdm
 from benchmarks.matcher import check_answer_detailed, extract_final_answer
 from core.api_call import async_llm_call_with_metadata
 from modules.execute_module import URLRouter
-from template.prompt_template import DIRECT_ANSWER_PROMPT
+from template.prompt_template import (
+    SOLVER_V1_FINALIZER_PROMPT,
+    SOLVER_V1_REASONER_PROMPT,
+)
 
 logger = logging.getLogger(__name__)
 
 
+STAGE1_SOLVER_PROTOCOL = "solver_v1.1"
+
+
+def _template_hash(template: str) -> str:
+    return hashlib.sha256(template.strip().encode("utf-8")).hexdigest()
+
+
+def prompt_hashes() -> Dict[str, str]:
+    return {
+        "reasoner": _template_hash(SOLVER_V1_REASONER_PROMPT),
+        "finalizer": _template_hash(SOLVER_V1_FINALIZER_PROMPT),
+    }
+
+
 def prompt_hash() -> str:
-    return hashlib.sha256(DIRECT_ANSWER_PROMPT.strip().encode("utf-8")).hexdigest()
+    payload = json.dumps(prompt_hashes(), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def normalize_final_answer(text: str) -> str:
@@ -61,10 +79,14 @@ class Stage1Sampler:
         model: str,
         api_key: str = "EMPTY",
         k_trials: int = 10,
+        panic_max_correct: int = 1,
+        master_min_correct: int = 9,
         experiment_seed: int = 42,
         temperature: float = 0.7,
         top_p: float = 0.95,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
+        finalizer_max_tokens: int = 128,
+        finalizer_timeout: int = 60,
         timeout: int = 600,
         request_logprobs: bool = True,
         top_logprobs: int = 5,
@@ -77,10 +99,19 @@ class Stage1Sampler:
         self.model = model
         self.api_key = api_key
         self.k_trials = int(k_trials)
+        self.panic_max_correct = int(panic_max_correct)
+        self.master_min_correct = int(master_min_correct)
+        if not 0 <= self.panic_max_correct < self.master_min_correct <= self.k_trials:
+            raise ValueError(
+                "zone thresholds must satisfy "
+                "0 <= panic_max_correct < master_min_correct <= k_trials"
+            )
         self.experiment_seed = int(experiment_seed)
         self.temperature = float(temperature)
         self.top_p = float(top_p)
         self.max_tokens = int(max_tokens)
+        self.finalizer_max_tokens = int(finalizer_max_tokens)
+        self.finalizer_timeout = int(finalizer_timeout)
         self.timeout = int(timeout)
         self.request_logprobs = bool(request_logprobs)
         self.top_logprobs = int(top_logprobs)
@@ -94,8 +125,17 @@ class Stage1Sampler:
         return [self.experiment_seed + index for index in range(self.k_trials)]
 
     @staticmethod
-    def level_from_correct_count(correct_count: int, planned_trials: int = 10) -> int:
-        if planned_trials <= 0 or correct_count <= 0 or correct_count >= planned_trials:
+    def level_from_correct_count(
+        correct_count: int,
+        planned_trials: int = 10,
+        panic_max_correct: int = 1,
+        master_min_correct: int = 9,
+    ) -> int:
+        if (
+            planned_trials <= 0
+            or correct_count <= panic_max_correct
+            or correct_count >= master_min_correct
+        ):
             return 0
         rate = correct_count / planned_trials
         if rate >= 0.75:
@@ -111,10 +151,25 @@ class Stage1Sampler:
         return cls.level_from_correct_count(
             int(result.get("correct_count") or 0),
             int(result.get("planned_trials") or 10),
+            int(result.get("panic_max_correct") or 1),
+            int(result.get("master_min_correct") or 9),
         )
 
+    @staticmethod
+    def zone_from_correct_count(
+        correct_count: int,
+        planned_trials: int,
+        panic_max_correct: int = 1,
+        master_min_correct: int = 9,
+    ) -> str:
+        if correct_count <= panic_max_correct:
+            return "panic"
+        if correct_count >= master_min_correct:
+            return "master"
+        return "learning"
+
     async def _single_inference_with_metadata(self, question: str, seed: int) -> Dict[str, Any]:
-        prompt = DIRECT_ANSWER_PROMPT.format(question=question)
+        reasoner_prompt = SOLVER_V1_REASONER_PROMPT.format(question=question)
         attempted: List[str] = []
         for _ in range(max(1, len(self.urls))):
             url = self.router.next()
@@ -122,8 +177,8 @@ class Stage1Sampler:
                 continue
             attempted.append(url)
             try:
-                result = await async_llm_call_with_metadata(
-                    prompt=prompt,
+                reasoner = await async_llm_call_with_metadata(
+                    prompt=reasoner_prompt,
                     model=self.model,
                     url=url,
                     api_key=self.api_key,
@@ -138,12 +193,55 @@ class Stage1Sampler:
                     include_raw=False,
                     seed=seed,
                 )
-                if result.get("text"):
-                    self.router.report_success(url)
-                    result["endpoint"] = url
-                    result["transport_status"] = "success"
-                    return result
-                self.router.report_failure(url, "empty response")
+                reasoner_text = str(reasoner.get("text") or "").strip()
+                if not reasoner_text:
+                    self.router.report_failure(url, "empty reasoner response")
+                    continue
+                finalizer_prompt = SOLVER_V1_FINALIZER_PROMPT.format(
+                    question=question,
+                    reasoner_output=reasoner_text,
+                )
+                finalizer = await async_llm_call_with_metadata(
+                    prompt=finalizer_prompt,
+                    model=self.model,
+                    url=url,
+                    api_key=self.api_key,
+                    temperature=0.0,
+                    top_p=self.top_p,
+                    max_tokens=self.finalizer_max_tokens,
+                    retries=1,
+                    timeout=self.finalizer_timeout,
+                    request_logprobs=False,
+                    include_raw=False,
+                    seed=seed,
+                )
+                finalizer_text = str(finalizer.get("text") or "").strip()
+                if not finalizer_text:
+                    self.router.report_failure(url, "empty finalizer response")
+                    continue
+                self.router.report_success(url)
+                return {
+                    "text": f"{reasoner_text}\n\n{finalizer_text}",
+                    "endpoint": url,
+                    "transport_status": "success",
+                    # Stage 1 uncertainty describes mathematical reasoning,
+                    # not the deterministic formatting call.
+                    "entropy": reasoner.get("entropy") or {
+                        "available": False,
+                        "normalized_entropy": None,
+                        "method": "unavailable",
+                    },
+                    "duration_sec": (
+                        float(reasoner.get("duration_sec") or 0.0)
+                        + float(finalizer.get("duration_sec") or 0.0)
+                    ),
+                    "solver_protocol": STAGE1_SOLVER_PROTOCOL,
+                    "prompt_hashes": prompt_hashes(),
+                    "reasoner_output": reasoner_text,
+                    "finalizer_output": finalizer_text,
+                    "reasoner_usage": reasoner.get("usage"),
+                    "finalizer_usage": finalizer.get("usage"),
+                }
             except Exception as exc:
                 self.router.report_failure(url, str(exc))
         return {
@@ -173,12 +271,15 @@ class Stage1Sampler:
         correct_mean = mean_available(correct_values)
         wrong_mean = mean_available(wrong_values)
         available = sum(isinstance(value, (int, float)) for value in token_values)
-        level = self.level_from_correct_count(correct_count, planned)
+        level = self.level_from_correct_count(
+            correct_count, planned, self.panic_max_correct, self.master_min_correct
+        )
         complete = len(successful) == planned
         zone = (
             "incomplete" if not complete else
-            "master" if correct_count == planned else
-            "panic" if correct_count == 0 else "learning"
+            self.zone_from_correct_count(
+                correct_count, planned, self.panic_max_correct, self.master_min_correct
+            )
         )
         if not complete:
             level = 0
@@ -191,6 +292,8 @@ class Stage1Sampler:
             "sr": rate,
             "zone": zone,
             "assigned_level": level,
+            "panic_max_correct": self.panic_max_correct,
+            "master_min_correct": self.master_min_correct,
             "correct_trajectories": [r["response"] for r in successful if r.get("is_correct")],
             "wrong_trajectories": [r["response"] for r in successful if r.get("is_correct") is False],
             "capability_signal": {
@@ -249,7 +352,12 @@ class Stage1Sampler:
         records = [dict(item) for item in (existing_records or []) if isinstance(item, dict)]
         completed_seeds = {
             int(item["seed"]) for item in records
-            if item.get("seed") is not None and item.get("transport_status") == "success"
+            if (
+                item.get("seed") is not None
+                and item.get("transport_status") == "success"
+                and item.get("prompt_version") == STAGE1_SOLVER_PROTOCOL
+                and item.get("prompt_hash") == prompt_hash()
+            )
         }
         for trial, seed in enumerate(self.rollout_seeds, start=1):
             if seed in completed_seeds:
@@ -274,8 +382,13 @@ class Stage1Sampler:
                 "match_method": match.get("method", "none"),
                 "match_reason": match.get("reason", ""),
                 "model": self.model,
-                "prompt_version": "stage1_direct_v1",
+                "prompt_version": STAGE1_SOLVER_PROTOCOL,
                 "prompt_hash": prompt_hash(),
+                "prompt_hashes": metadata.get("prompt_hashes") or prompt_hashes(),
+                "reasoner_output": metadata.get("reasoner_output", ""),
+                "finalizer_output": metadata.get("finalizer_output", ""),
+                "reasoner_usage": metadata.get("reasoner_usage"),
+                "finalizer_usage": metadata.get("finalizer_usage"),
                 "endpoint": metadata.get("endpoint", ""),
                 "transport_status": metadata.get("transport_status", "infrastructure_failed"),
                 "duration_sec": metadata.get("duration_sec"),
@@ -297,9 +410,12 @@ class Stage1Sampler:
             "trial_records": records,
             "sampling_config": {
                 "model": self.model,
-                "prompt_version": "stage1_direct_v1",
+                "prompt_version": STAGE1_SOLVER_PROTOCOL,
                 "prompt_hash": prompt_hash(),
+                "prompt_hashes": prompt_hashes(),
                 "k_trials": self.k_trials,
+                "panic_max_correct": self.panic_max_correct,
+                "master_min_correct": self.master_min_correct,
                 "rollout_seeds": self.rollout_seeds,
                 "experiment_seed": self.experiment_seed,
                 "temperature": self.temperature,
@@ -307,10 +423,77 @@ class Stage1Sampler:
                 "top_logprobs": self.top_logprobs,
                 "entropy_histogram_bins": self.entropy_histogram_bins,
                 "max_tokens": self.max_tokens,
+                "reasoner_max_tokens": self.max_tokens,
+                "finalizer_max_tokens": self.finalizer_max_tokens,
+                "finalizer_temperature": 0.0,
+                "finalizer_timeout": self.finalizer_timeout,
                 "early_stop": False,
             },
         }
         return self.finalize_result(result)
+
+    @classmethod
+    def reclassify_sampling_data(
+        cls,
+        data: Dict[str, Any],
+        *,
+        panic_max_correct: int = 1,
+        master_min_correct: int = 9,
+    ) -> Dict[str, Any]:
+        """Rebuild zones and level_data from saved rollouts without LLM calls."""
+        results = list(data.get("results") or [])
+        levels = {str(level): [] for level in range(1, 5)}
+        for result in results:
+            if result.get("zone") == "invalid_input":
+                continue
+            planned = int(result.get("planned_trials") or 10)
+            successful = int(result.get("successful_trials") or 0)
+            if successful != planned:
+                result["zone"] = "incomplete"
+                result["assigned_level"] = 0
+                continue
+            correct_count = int(result.get("correct_count") or 0)
+            zone = cls.zone_from_correct_count(
+                correct_count, planned, panic_max_correct, master_min_correct
+            )
+            level = cls.level_from_correct_count(
+                correct_count, planned, panic_max_correct, master_min_correct
+            )
+            result["zone"] = zone
+            result["assigned_level"] = level
+            result["panic_max_correct"] = panic_max_correct
+            result["master_min_correct"] = master_min_correct
+            signal = result.setdefault("capability_signal", {})
+            signal["assigned_level"] = f"level{level}" if level else zone
+            if level:
+                levels[str(level)].append(result)
+
+        config = dict(data.get("config") or {})
+        config.update({
+            "panic_max_correct": panic_max_correct,
+            "master_min_correct": master_min_correct,
+            "zone_policy": "panic_0_1_learning_2_8_master_9_10",
+        })
+        data["config"] = config
+        data["level_data"] = levels
+        data["summary"] = {
+            "total": len(results),
+            "master_zone": sum(item.get("zone") == "master" for item in results),
+            "learning_zone": sum(item.get("zone") == "learning" for item in results),
+            "panic_zone": sum(item.get("zone") == "panic" for item in results),
+            "incomplete": sum(item.get("zone") == "incomplete" for item in results),
+            "invalid_input": sum(item.get("zone") == "invalid_input" for item in results),
+            "zone_policy": {
+                "master": f"correct_count >= {master_min_correct}",
+                "learning": (
+                    f"{panic_max_correct} < correct_count < {master_min_correct}"
+                ),
+                "panic": f"correct_count <= {panic_max_correct}",
+                "incomplete": "successful_trials < planned_trials",
+            },
+            "levels": {key: len(value) for key, value in levels.items()},
+        }
+        return data
 
     @staticmethod
     def _load_checkpoint(path: Optional[str]) -> Dict[str, List[Dict[str, Any]]]:
@@ -414,6 +597,8 @@ class Stage1Sampler:
             "schema_version": "stage1.1",
             "config": {
                 "k_trials": self.k_trials,
+                "panic_max_correct": self.panic_max_correct,
+                "master_min_correct": self.master_min_correct,
                 "experiment_seed": self.experiment_seed,
                 "rollout_seeds": self.rollout_seeds,
                 "temperature": self.temperature,
@@ -437,9 +622,12 @@ class Stage1Sampler:
                 ),
                 "invalid_input": sum(item["zone"] == "invalid_input" for item in ordered),
                 "zone_policy": {
-                    "master": "correct_count == planned_trials",
-                    "learning": "0 < correct_count < planned_trials",
-                    "panic": "correct_count == 0",
+                    "master": f"correct_count >= {self.master_min_correct}",
+                    "learning": (
+                        f"{self.panic_max_correct} < correct_count < "
+                        f"{self.master_min_correct}"
+                    ),
+                    "panic": f"correct_count <= {self.panic_max_correct}",
                     "incomplete": "successful_trials < planned_trials",
                 },
                 "levels": {key: len(value) for key, value in levels.items()},

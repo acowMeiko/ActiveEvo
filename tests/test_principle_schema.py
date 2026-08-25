@@ -38,6 +38,7 @@ def test_stage2_extended_schema_is_required_when_requested():
     extended = {
         **LEGACY,
         "required_evidence": ["The current row-size recurrence is explicitly established."],
+        "failure_signals": ["The draft transfers a row offset without deriving the current recurrence."],
         "exclusion_condition": "Reject if the current recurrence differs from the source recurrence.",
         "verification_step": "Recompute the requested index from the current recurrence.",
         "generalization_level": "family",
@@ -51,6 +52,7 @@ def test_stage2_required_evidence_rejects_string_but_legacy_reader_normalizes_it
     extended = {
         **LEGACY,
         "required_evidence": "The current recurrence is explicit.",
+        "failure_signals": ["The draft copies a source recurrence."],
         "exclusion_condition": "Reject if the recurrence changes.",
         "verification_step": "Recompute using the current recurrence.",
         "generalization_level": "family",
@@ -72,6 +74,7 @@ def test_stage2_parser_preserves_exact_extended_schema():
     extended = {
         **LEGACY,
         "required_evidence": ["The current recurrence is established."],
+        "failure_signals": ["The draft uses an unsupported row-size formula."],
         "exclusion_condition": "Reject if the current recurrence changes.",
         "verification_step": "Recompute from the current recurrence.",
         "generalization_level": "family",

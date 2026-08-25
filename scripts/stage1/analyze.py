@@ -7,9 +7,14 @@ import json
 from pathlib import Path
 
 
-def load_bundles(stage1_dir: Path) -> list[dict]:
+def load_bundles(stage1_dir: Path, packet_dir: Path | None = None) -> list[dict]:
     bundles: list[dict] = []
-    for path in sorted((stage1_dir / "02_learning_packets").glob("*/level*_learning_packets.json")):
+    paths = (
+        sorted(Path(packet_dir).glob("level*_learning_packets.json"))
+        if packet_dir is not None else
+        sorted((stage1_dir / "02_learning_packets").glob("*/level*_learning_packets.json"))
+    )
+    for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(payload, list):
             bundles.extend(item for item in payload if isinstance(item, dict))
@@ -25,7 +30,7 @@ def _values(bundle: dict) -> tuple[float, float | None, float | None, float | No
     )
 
 
-def generate_figures(stage1_dir: Path) -> list[Path]:
+def generate_figures(stage1_dir: Path, packet_dir: Path | None = None) -> list[Path]:
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -33,7 +38,7 @@ def generate_figures(stage1_dir: Path) -> list[Path]:
     except ImportError as exc:
         raise RuntimeError("matplotlib is required: install requirements.txt") from exc
 
-    bundles = load_bundles(stage1_dir)
+    bundles = load_bundles(stage1_dir, packet_dir=packet_dir)
     if not bundles:
         raise ValueError(f"No Stage 1 bundles found below {stage1_dir}")
     output = stage1_dir / "figures"

@@ -251,16 +251,28 @@ class PipelineConfig:
     stage1_expected_dataset_sha256: str = "9d8b634043cb008076cbf60b7c8a01fddaeb2a83f9d3a8de564b05dd176eb225"
     stage1_expected_dataset_size: int = 6000
     stage1_k_trials: int = 10
+    # Capability zones are mutually exclusive.  With ten rollouts:
+    # Panic = 0-1 correct, Learning = 2-8 correct, Master = 9-10 correct.
+    stage1_panic_max_correct: int = 1
+    stage1_master_min_correct: int = 9
     stage1_experiment_seed: int = 42
     stage1_temperature: float = 0.7
     stage1_top_p: float = 0.95
     stage1_top_logprobs: int = 5
     stage1_entropy_histogram_bins: int = 20
-    stage1_max_tokens: int = 4096
+    # Stage 1 uses the same two-stage Solver-v1.1 protocol as downstream
+    # baseline/guided evaluation.  This is the Reasoner budget; the Finalizer
+    # has its own small deterministic budget.
+    stage1_max_tokens: int = 8192
+    stage1_finalizer_max_tokens: int = 128
+    stage1_finalizer_timeout: int = 60
     stage1_disable_early_stop: bool = True
     stage1_concurrency: int = 16
     stage1_task_batch_size: int = 1000
     stage2_concurrency: int = 8
+    stage2_source_validation_concurrency: int = 2
+    stage2_source_validation_seeds: Tuple[int, ...] = tuple(range(42, 52))
+    stage2_source_validation_temperatures: Tuple[float, ...] = (0.7, 0.2)
     stage3_concurrency: int = 8
     stage3_threshold: float = 0.55
     stage3_candidate_top_k: int = 12
@@ -279,19 +291,88 @@ class Stage2Config:
 
     max_principles_per_question: int = 3
     reconciliation_top_k: int = 5
-    generation_max_tokens: int = 3072
-    audit_max_tokens: int = 2048
+    generation_analysis_max_tokens: int = 8192
+    generation_max_tokens: int = 4096
+    audit_max_tokens: int = 8192
+    audit_retry_max_tokens: int = 8192
+    audit_formatter_max_tokens: int = 3072
+    generator_timeout: int = 900
+    auditor_timeout: int = 900
+    generator_retries: int = 2
+    auditor_retries_per_endpoint: int = 1
+    generator_thinking_enabled: bool = True
+    generator_synthesis_thinking_enabled: bool = False
+    generator_seed: int = 42
+    qwen_generation_analysis_max_tokens: int = 6144
+    qwen_generation_max_tokens: int = 4096
+    qwen_generation_retry_max_tokens: int = 8192
+    qwen_generator_model: str = os.environ.get("ACTIVEEVO_QWEN_GENERATOR_MODEL", "qwen")
+    qwen_generator_urls: tuple[str, ...] = tuple(
+        value
+        for value in re.split(
+            r"[\s,]+",
+            os.environ.get(
+                "ACTIVEEVO_QWEN_GENERATOR_URLS",
+                "http://localhost:8200/v1/chat/completions,http://localhost:8201/v1/chat/completions",
+            ).strip(),
+        )
+        if value
+    )
+    qwen_generator_key_env: str = "ACTIVEEVO_QWEN_GENERATOR_API_KEY"
+    qwen_generator_temperature: float = 1.0
+    qwen_generator_top_p: float = 0.95
+    qwen_generator_top_k: int = 20
+    qwen_generator_min_p: float = 0.0
+    qwen_generator_presence_penalty: float = 0.0
+    qwen_generator_repetition_penalty: float = 1.0
+    # ``medium`` is accepted by both vLLM's outer request schema and Qwen3.8's
+    # model-level parser.  It keeps thinking enabled without the long xhigh
+    # deliberation that exhausted the source-generation timeout.
+    qwen_generator_reasoning_effort: str = "medium"
+    auditor_thinking_enabled: bool = True
+    auditor_reasoning_effort: str = "medium"
     validation_seed: int = 42
     generator_model: str = os.environ.get("ACTIVEEVO_GENERATOR_MODEL", "deepseek-v4-pro")
     generator_url: str = os.environ.get(
         "ACTIVEEVO_GENERATOR_URL", "https://api.deepseek.com/v1/chat/completions"
     )
     generator_key_env: str = "ACTIVEEVO_GENERATOR_API_KEY"
-    auditor_model: str = os.environ.get("ACTIVEEVO_AUDITOR_MODEL", "qwen")
+    auditor_provider: str = os.environ.get("ACTIVEEVO_AUDITOR_PROVIDER", "kimi")
+    auditor_model: str = os.environ.get("ACTIVEEVO_AUDITOR_MODEL", "kimi-k2.6")
     auditor_url: str = os.environ.get(
-        "ACTIVEEVO_AUDITOR_URL", "http://localhost:8200/v1/chat/completions"
+        "ACTIVEEVO_AUDITOR_URL", "https://api.moonshot.cn/v1/chat/completions"
+    )
+    auditor_urls: tuple[str, ...] = tuple(
+        value
+        for value in re.split(
+            r"[\s,]+",
+            os.environ.get("ACTIVEEVO_AUDITOR_URLS", "").strip()
+            or os.environ.get(
+                "ACTIVEEVO_AUDITOR_URL",
+                "https://api.moonshot.cn/v1/chat/completions",
+            ).strip(),
+        )
+        if value
     )
     auditor_key_env: str = "ACTIVEEVO_AUDITOR_API_KEY"
+    kimi_thinking_temperature: float = 1.0
+    kimi_thinking_top_p: float = 0.95
+    kimi_nonthinking_temperature: float = 0.6
+    kimi_nonthinking_top_p: float = 0.95
+    principle_test_seed: int = 42
+    principle_test_sources_per_level: int = 10
+    principle_test_reserve_per_level: int = 5
+    principle_test_audit_repeats: int = 3
+    principle_test_variant_attempts: int = 3
+    principle_test_solver_seeds: tuple[int, ...] = tuple(range(42, 52))
+    principle_test_primary_temperature: float = 0.2
+    principle_test_robustness_temperature: float = 0.7
+    role_compare_seeds: tuple[int, ...] = (42, 43, 44)
+    role_compare_temperature: float = 0.2
+    role_compare_initial_concurrency: int = 4
+    role_compare_kimi_critic_max_tokens: int = 4096
+    role_compare_audit_max_tokens: int = 8192
+    role_compare_kimi_generation_retry_max_tokens: int = 8192
 
 @dataclass(frozen=True)
 class Config:

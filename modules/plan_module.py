@@ -165,6 +165,14 @@ def _normalize_principle_fields(data: Dict[str, Any]) -> Dict[str, Any]:
             evidence = [evidence.strip()] if evidence.strip() else []
         elif isinstance(evidence, list):
             evidence = [str(value).strip() for value in evidence if isinstance(value, str) and value.strip()]
+        failure_signals = item.get("failure_signals", item.get("FailureSignals", []))
+        if isinstance(failure_signals, str):
+            failure_signals = [failure_signals.strip()] if failure_signals.strip() else []
+        elif isinstance(failure_signals, list):
+            failure_signals = [
+                str(value).strip() for value in failure_signals
+                if isinstance(value, str) and value.strip()
+            ]
         normalized.append(
             {
                 "introspection": str(item.get("introspection", item.get("Introspection", ""))).strip(),
@@ -176,6 +184,7 @@ def _normalize_principle_fields(data: Dict[str, Any]) -> Dict[str, Any]:
                 "generalization_level": str(item.get("generalization_level", item.get("GeneralizationLevel", "family"))).strip(),
                 "scope": str(item.get("scope", item.get("Scope", ""))).strip(),
                 "failure_mode": str(item.get("failure_mode", item.get("FailureMode", ""))).strip(),
+                "failure_signals": failure_signals,
             }
         )
     if normalized:
@@ -374,7 +383,7 @@ class PlanModule:
         """
         required = {
             "introspection", "trigger_condition", "required_evidence",
-            "exclusion_condition", "action_guidance", "verification_step",
+            "failure_signals", "exclusion_condition", "action_guidance", "verification_step",
             "generalization_level", "scope", "failure_mode",
         }
         for candidate in self._json_candidates(text):
@@ -403,6 +412,7 @@ class PlanModule:
             schema = (
                 '{"principles":[{"introspection":"...","trigger_condition":"...",'
                 '"required_evidence":["..."],"exclusion_condition":"...",'
+                '"failure_signals":["..."],'
                 '"action_guidance":"...","verification_step":"...",'
                 '"generalization_level":"family","scope":"...","failure_mode":"..."}]}'
             )
@@ -410,6 +420,7 @@ class PlanModule:
             schema = (
                 '{"principle":{"introspection":"...","trigger_condition":"...",'
                 '"required_evidence":["..."],"exclusion_condition":"...",'
+                '"failure_signals":["..."],'
                 '"action_guidance":"...","verification_step":"...",'
                 '"generalization_level":"family","scope":"...","failure_mode":"..."}}'
             )
@@ -786,6 +797,7 @@ class PlanModule:
                 "exclusion_condition": content.get("exclusion_condition", ""),
                 "scope": content.get("scope", ""),
                 "failure_mode": content.get("failure_mode", ""),
+                "failure_signals": content.get("failure_signals", []),
                 "action_guidance": content.get("action_guidance", ""),
                 "verification_step": content.get("verification_step", ""),
                 "generalization_level": content.get("generalization_level", "family"),
@@ -808,7 +820,18 @@ class PlanModule:
             strict_value = json.loads((response or "").strip())
         except Exception:
             strict_value = None
-        if not (isinstance(strict_value, dict) and isinstance(strict_value.get("judgments"), list)):
+        strict_wire_format = isinstance(strict_value, dict) and isinstance(
+            strict_value.get("judgments"), list
+        )
+        # A complete object inside a Markdown fence (optionally followed by an
+        # explanation) is losslessly normalizable.  This fixes presentation
+        # noise only; direct lists, missing IDs, wrong types, and incomplete
+        # judgments remain fail-closed below.
+        format_normalized = False
+        if not strict_wire_format and parse_stage == "wrapped_object" and isinstance(parsed, dict):
+            parse_stage = "wrapped_object_normalized"
+            format_normalized = True
+        elif not strict_wire_format:
             protocol_errors.append("top_level_must_be_raw_object_with_judgments_array")
         if len(returned_ids) != len(set(returned_ids)):
             protocol_errors.append("duplicate_memory_id")
@@ -892,6 +915,8 @@ class PlanModule:
             "status": "success" if parsed else "parse_failed",
             "parse_stage": parse_stage,
             "format_parsed": bool(parsed),
+            "format_normalized": format_normalized,
+            "strict_wire_format": strict_wire_format,
             "protocol_compliant": bool(parsed) and not protocol_errors,
             "protocol_errors": protocol_errors,
             "confidence_threshold": confidence_threshold,
@@ -937,6 +962,7 @@ class PlanModule:
                 "required_evidence": content.get("required_evidence", []),
                 "exclusion_condition": content.get("exclusion_condition", ""),
                 "failure_mode": content.get("failure_mode", ""),
+                "failure_signals": content.get("failure_signals", []),
                 "action_guidance": content.get("action_guidance", ""),
                 "verification_step": content.get("verification_step", ""),
                 "scope": content.get("scope", ""),
@@ -950,6 +976,19 @@ class PlanModule:
         )
         response = await self._call_llm(prompt, temperature=0.0, max_tokens=2048)
         parsed = self._extract_json(response, task="generic") or {}
+        format_normalizations = []
+        # Local models often express the requested 3-6 advisory sentences and
+        # 2-4 checks as JSON string arrays.  Joining a pure list[str] is
+        # lossless presentation normalization; mixed/empty lists still fail
+        # the strict condition-card validator.
+        for field in ("suggested_action", "verification"):
+            raw_value = parsed.get(field)
+            if (
+                isinstance(raw_value, list) and raw_value
+                and all(isinstance(item, str) and item.strip() for item in raw_value)
+            ):
+                parsed[field] = " ".join(" ".join(item.split()) for item in raw_value)
+                format_normalizations.append(f"{field}:list_str_to_string")
         card, schema_errors = validate_condition_card(parsed)
         status = card.get("status", "reject")
         if schema_errors:
@@ -959,6 +998,7 @@ class PlanModule:
             "status": status,
             "condition_card": card if status == "use" else {},
             "schema_errors": schema_errors,
+            "format_normalizations": format_normalizations,
             "source_principle": content,
             "reason": str(parsed.get("reason", "parse_failed_or_rejected")).strip(),
             "raw_response": response,

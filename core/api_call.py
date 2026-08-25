@@ -407,6 +407,7 @@ async def async_llm_call_with_metadata(
 
     timeout_obj = aiohttp.ClientTimeout(total=timeout, connect=20)
     logprob_retry_used = False
+    transport_attempts: list[Dict[str, Any]] = []
 
     try:
         for attempt in range(1, retries + 1):
@@ -419,6 +420,7 @@ async def async_llm_call_with_metadata(
                 async with session.post(request_url, headers=headers, json=payload, timeout=timeout_obj) as resp:
                     if resp.status == 200:
                         data = await resp.json()
+                        transport_attempts.append({"attempt": attempt, "http_status": 200})
                         result = _metadata_response(
                             prompt,
                             data,
@@ -430,9 +432,14 @@ async def async_llm_call_with_metadata(
                                 f"API returned 200 but empty parsed content. Model: {model} | URL: {request_url} | "
                                 f"ResponsePreview: {json.dumps(data, ensure_ascii=False)[:500]}"
                             )
+                        result["transport_attempts"] = transport_attempts
                         return result
 
                     error_text = await resp.text()
+                    transport_attempts.append({
+                        "attempt": attempt, "http_status": resp.status,
+                        "error_preview": error_text[:200],
+                    })
                     record_llm_call(
                         prompt=prompt,
                         response="",
@@ -459,10 +466,12 @@ async def async_llm_call_with_metadata(
 
                     if resp.status == 404:
                         logger.error("HTTP 404: check whether the model endpoint and model name are correct.")
-                        return _metadata_response(
+                        result = _metadata_response(
                             prompt, {}, time.perf_counter() - attempt_start,
                             include_raw=include_raw, record_metrics=False
                         )
+                        result["transport_attempts"] = transport_attempts
+                        return result
                     if resp.status in [429, 500, 502, 503, 504]:
                         wait_time = 2 ** attempt
                         logger.info(f"Retrying in {wait_time}s...")
@@ -470,12 +479,15 @@ async def async_llm_call_with_metadata(
                         continue
                     if resp.status in [401, 400, 403]:
                         logger.error(f"Critical API Error: {error_text}")
-                        return _metadata_response(
+                        result = _metadata_response(
                             prompt, {}, time.perf_counter() - attempt_start,
                             include_raw=include_raw, record_metrics=False
                         )
+                        result["transport_attempts"] = transport_attempts
+                        return result
 
             except asyncio.TimeoutError:
+                transport_attempts.append({"attempt": attempt, "error": "timeout"})
                 record_llm_call(
                     prompt=prompt,
                     response="",
@@ -488,6 +500,10 @@ async def async_llm_call_with_metadata(
                 )
                 await asyncio.sleep(2)
             except Exception as e:
+                transport_attempts.append({
+                    "attempt": attempt, "error": "network_exception",
+                    "error_preview": str(e)[:200],
+                })
                 record_llm_call(
                     prompt=prompt,
                     response="",
@@ -504,7 +520,11 @@ async def async_llm_call_with_metadata(
             "Failed to get response from %s (%s) after %d endpoint attempt(s).",
             model, request_context_label(), retries,
         )
-        return _metadata_response(prompt, {}, 0.0, include_raw=include_raw, record_metrics=False)
+        result = _metadata_response(
+            prompt, {}, 0.0, include_raw=include_raw, record_metrics=False
+        )
+        result["transport_attempts"] = transport_attempts
+        return result
 
     finally:
         if manage_session and session:

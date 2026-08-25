@@ -17,6 +17,9 @@ modules = (
     "tests.test_application_gate", "tests.test_matcher", "tests.test_principle_schema",
     "tests.test_reranker_routing", "tests.test_solver_v1", "tests.test_stage1_signal",
     "tests.test_stage2_factory", "tests.test_stage3_experiment_metrics",
+    "tests.test_stage2_source_validation",
+    "tests.test_stage2_principle_test", "tests.test_stage2_model_client",
+    "tests.test_stage2_incremental_registry",
 )
 count = 0
 for module_name in modules:

@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Mapping, Tuple
 
 
-SCHEMA_VERSION = "3.0"
+SCHEMA_VERSION = "4.0"
 
 
 LEGACY_PRINCIPLE_FIELDS = (
@@ -22,6 +22,7 @@ LEGACY_PRINCIPLE_FIELDS = (
 
 EXTENDED_PRINCIPLE_FIELDS = (
     "required_evidence",
+    "failure_signals",
     "exclusion_condition",
     "verification_step",
     "generalization_level",
@@ -30,26 +31,29 @@ EXTENDED_PRINCIPLE_FIELDS = (
 PRINCIPLE_FIELDS = LEGACY_PRINCIPLE_FIELDS + EXTENDED_PRINCIPLE_FIELDS
 
 
-def _normalize_evidence_list(value: Any, *, compatibility: bool) -> Tuple[List[str], List[str]]:
-    """Normalize required evidence without silently stringifying containers."""
+def _normalize_string_list(
+    value: Any, *, field: str, compatibility: bool
+) -> Tuple[List[str], List[str]]:
+    """Normalize a canonical list field without stringifying containers."""
     if isinstance(value, list):
         normalized = [" ".join(item.split()).strip() for item in value if isinstance(item, str)]
         errors = []
         if len(normalized) != len(value):
-            errors.append("required_evidence items must be strings")
+            errors.append(f"{field} items must be strings")
         normalized = [item for item in normalized if item]
         if not normalized:
-            errors.append("required_evidence must contain at least one non-empty string")
+            errors.append(f"{field} must contain at least one non-empty string")
         return normalized, errors
     if compatibility and isinstance(value, str) and value.strip():
         return [" ".join(value.split()).strip()], []
-    return [], ["required_evidence must be a list of non-empty strings"]
+    return [], [f"{field} must be a list of non-empty strings"]
 
 
 def _extended_defaults(content: Dict[str, Any]) -> Dict[str, Any]:
     """Provide auditable compatibility defaults for pre-v3 memories."""
     normalized = dict(content)
     normalized.setdefault("required_evidence", [normalized.get("trigger_condition", "")])
+    normalized.setdefault("failure_signals", [normalized.get("failure_mode", "")])
     normalized.setdefault(
         "exclusion_condition",
         "Reject when any required trigger, mathematical structure, constraint, or objective is absent.",
@@ -80,8 +84,10 @@ def validate_principle_content(
     required_fields = PRINCIPLE_FIELDS if require_extended else LEGACY_PRINCIPLE_FIELDS
     for field in required_fields:
         raw = value.get(field)
-        if field == "required_evidence":
-            evidence, evidence_errors = _normalize_evidence_list(raw, compatibility=not require_extended)
+        if field in {"required_evidence", "failure_signals"}:
+            evidence, evidence_errors = _normalize_string_list(
+                raw, field=field, compatibility=not require_extended
+            )
             normalized[field] = evidence
             errors.extend(evidence_errors)
             continue
@@ -97,8 +103,10 @@ def validate_principle_content(
     for field in EXTENDED_PRINCIPLE_FIELDS:
         if field in value and field not in normalized:
             raw = value.get(field)
-            if field == "required_evidence":
-                evidence, evidence_errors = _normalize_evidence_list(raw, compatibility=True)
+            if field in {"required_evidence", "failure_signals"}:
+                evidence, evidence_errors = _normalize_string_list(
+                    raw, field=field, compatibility=True
+                )
                 normalized[field] = evidence
                 errors.extend(evidence_errors)
                 continue
@@ -176,6 +184,7 @@ def build_memory_views(
             "task_objective": str(source_dsd.get("task_objective", "")),
             "trigger_condition": content["trigger_condition"],
             "required_evidence": content.get("required_evidence", content["trigger_condition"]),
+            "failure_signals": content.get("failure_signals", [content["failure_mode"]]),
             "exclusion_condition": content.get("exclusion_condition", ""),
             "scope": content["scope"],
             "failure_mode": content["failure_mode"],

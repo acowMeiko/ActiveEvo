@@ -40,6 +40,24 @@ SOLVER_V1_FINALIZER_TEMPERATURE = 0.0
 SOLVER_V1_TOP_P = 0.95
 SOLVER_V1_REASONER_REPETITION_PENALTY = 1.0
 
+SOLVER_V1_INITIAL_PLAN_PROMPT = r'''
+You are preparing a short mathematical plan, not solving the problem yet.
+
+Identify only:
+1. the mathematical structure;
+2. the main operation, invariant, or case split;
+3. two to four ordered steps that a later solver should attempt.
+
+Do not calculate the final result, do not state a final answer, and do not use
+external experience. Output at most 180 words under exactly one heading:
+
+Initial Plan:
+[plan]
+
+Problem:
+{question}
+'''
+
 
 def _prompt_hash(template: str) -> str:
     return hashlib.sha256(template.strip().encode("utf-8")).hexdigest()
@@ -467,6 +485,42 @@ class ExecuteModule:
             "composed_output": composed,
             "infrastructure_success": bool(finalizer_output),
             "infrastructure_stage": "" if finalizer_output else "finalizer",
+        }
+
+    async def draft_plan_v1(
+        self,
+        question: str,
+        *,
+        seed: Optional[int] = None,
+        url_override: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 768,
+        timeout: int = 120,
+    ) -> Dict[str, Any]:
+        """Produce the equal-cost initial plan used by the B3/plan-only arms."""
+        prompt = SOLVER_V1_INITIAL_PLAN_PROMPT.format(question=question)
+        metadata, endpoint = await self._call_with_router_metadata(
+            prompt=prompt,
+            temperature=temperature,
+            top_p=SOLVER_V1_TOP_P,
+            max_tokens=max_tokens,
+            repetition_penalty=1.0,
+            seed=seed,
+            url_override=url_override,
+            timeout_override=timeout,
+        )
+        output = str(metadata.get("text") or "").strip()
+        return {
+            "prompt": prompt,
+            "prompt_hash": _prompt_hash(SOLVER_V1_INITIAL_PLAN_PROMPT),
+            "output": output,
+            "endpoint": endpoint,
+            "seed": self.seed if seed is None else seed,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "finish_reason": _finish_reason(metadata),
+            "usage": metadata.get("usage"),
+            "infrastructure_success": bool(output),
         }
 
     # ================================================================

@@ -415,12 +415,16 @@ class AgentPipeline:
         dataset_path: Optional[str] = None,
         concurrency: int = 10,
         k_trials: int = 10,
+        panic_max_correct: int = 1,
+        master_min_correct: int = 9,
         experiment_seed: int = 42,
         temperature: float = 0.7,
         top_p: float = 0.95,
         top_logprobs: int = 5,
         entropy_histogram_bins: int = 20,
-        max_tokens: int = 4096,
+        max_tokens: int = 8192,
+        finalizer_max_tokens: int = 128,
+        finalizer_timeout: int = 60,
         task_batch_size: int = 1000,
         expected_dataset_sha256: str = "",
         expected_dataset_size: int = 6000,
@@ -489,10 +493,15 @@ class AgentPipeline:
                     existing = load_json(str(sampling_path))
                     expected_config = {
                         "k_trials": k_trials,
+                        "panic_max_correct": panic_max_correct,
+                        "master_min_correct": master_min_correct,
                         "experiment_seed": experiment_seed,
                         "temperature": temperature,
                         "top_p": top_p,
                         "top_logprobs": top_logprobs,
+                        "reasoner_max_tokens": max_tokens,
+                        "finalizer_max_tokens": finalizer_max_tokens,
+                        "solver_protocol": "solver_v1.1",
                         "early_stop": False,
                     }
                     existing_config = existing.get("config", {}) if isinstance(existing, dict) else {}
@@ -531,12 +540,16 @@ class AgentPipeline:
                         model=_model,
                         api_key=self.execute.api_key,
                         k_trials=k_trials,
+                        panic_max_correct=panic_max_correct,
+                        master_min_correct=master_min_correct,
                         experiment_seed=experiment_seed,
                         temperature=temperature,
                         top_p=top_p,
                         top_logprobs=top_logprobs,
                         entropy_histogram_bins=entropy_histogram_bins,
                         max_tokens=max_tokens,
+                        finalizer_max_tokens=finalizer_max_tokens,
+                        finalizer_timeout=finalizer_timeout,
                         task_batch_size=task_batch_size,
                         timeout=self.execute.timeout,
                     )
@@ -556,6 +569,13 @@ class AgentPipeline:
                             "Resume with the same configuration before building Learning Bundles."
                         )
 
+            # Zoning is deterministic and independent of model sampling.  This
+            # also lets --skip-sampling reuse old rollouts under a new policy.
+            sampling_data = Stage1Sampler.reclassify_sampling_data(
+                sampling_data,
+                panic_max_correct=panic_max_correct,
+                master_min_correct=master_min_correct,
+            )
             summary = sampling_data.get("summary", {})
             level_data = sampling_data.get("level_data", {})
 
@@ -586,12 +606,16 @@ class AgentPipeline:
             # 保存 —— 按 backbone 分目录
             packets_dir = stage1_level_packets_file(output_root, 1, backbone).parent
             Stage1Miner.save(packets, packets_dir)
-            stage1_root = packets_dir.parent.parent
-            save_rankings_and_manifests(mining_result.get("rankings", {}), stage1_root)
-            write_analysis_csv(packets, stage1_root / "analysis" / "questions.csv")
+            # Keep all derived artifacts isolated by backbone/run tag.  The
+            # canonical Learning Bundle path remains unchanged for Stage 2,
+            # while rankings, manifests, CSVs and figures no longer overwrite
+            # an earlier Stage 1 experiment.
+            stage1_run_root = output_root / "stage1" / "runs" / tag
+            save_rankings_and_manifests(mining_result.get("rankings", {}), stage1_run_root)
+            write_analysis_csv(packets, stage1_run_root / "analysis" / "questions.csv")
             from scripts.stage1.analyze import generate_figures
-            figure_paths = generate_figures(stage1_root)
-            (stage1_root / "run_manifest.json").write_text(json.dumps({
+            figure_paths = generate_figures(stage1_run_root, packet_dir=packets_dir)
+            (stage1_run_root / "run_manifest.json").write_text(json.dumps({
                 "schema_version": "stage1.1",
                 "dataset_path": str(Path(src).resolve()),
                 "dataset_sha256": dataset_sha256,
@@ -600,6 +624,7 @@ class AgentPipeline:
                 "model": _model,
                 "ports": _urls,
                 "sampling_config": sampling_data.get("config", {}),
+                "zone_policy": summary.get("zone_policy", {}),
                 "ranking_policies": ["random", "high_token_entropy", "low_token_entropy"],
                 "figures": [str(path) for path in figure_paths],
             }, ensure_ascii=False, indent=2), encoding="utf-8")

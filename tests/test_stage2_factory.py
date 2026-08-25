@@ -1,5 +1,5 @@
 from modules.stage2.contracts import build_learning_bundles, validate_learning_bundle
-from modules.stage2.quality_audit import deterministic_leakage_check
+from modules.stage2.quality_audit import deterministic_leakage_check, normalize_audit_evidence_refs
 from modules.stage1_miner import mine_pairs
 
 
@@ -44,6 +44,7 @@ def test_literal_source_payload_leak_is_rejected() -> None:
         "required_evidence": ["The recurrence is visible."],
         "exclusion_condition": "The recurrence differs.",
         "failure_mode": "Copying a source constant.",
+        "failure_signals": ["The draft substitutes a constant that is not derived from the problem."],
         "action_guidance": "Derive the value from the current recurrence.",
         "verification_step": "Substitute the result.",
         "generalization_level": "family",
@@ -66,3 +67,15 @@ def test_every_wrong_trajectory_keeps_a_correct_contrast() -> None:
     pairs = mine_pairs(sample)
     assert len(pairs) == 2
     assert all(pair["anchor"] for pair in pairs)
+
+
+def test_audit_id_normalization_requires_unique_near_match() -> None:
+    dimensions = {"source_fidelity": {"evidence_refs": ["7838e2d41e2599ed8bc"]}}
+    repairs = normalize_audit_evidence_refs(dimensions, {"7838e2d41e2599ed8bc8", "other"})
+    assert dimensions["source_fidelity"]["evidence_refs"] == ["7838e2d41e2599ed8bc8"]
+    assert repairs == [{"from": "7838e2d41e2599ed8bc", "to": "7838e2d41e2599ed8bc8"}]
+
+    ambiguous = {"source_fidelity": {"evidence_refs": ["abc"]}}
+    repairs = normalize_audit_evidence_refs(ambiguous, {"abc1", "abc2"})
+    assert ambiguous["source_fidelity"]["evidence_refs"] == ["abc"]
+    assert repairs == []

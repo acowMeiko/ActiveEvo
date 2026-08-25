@@ -6,7 +6,12 @@ from pathlib import Path
 
 from core.api_call import _logprob_entropy_summary
 from modules.stage1_miner import Stage1Miner, save_rankings_and_manifests, write_analysis_csv
-from modules.stage1_sampler import Stage1Sampler, normalized_answer_entropy
+from modules.stage1_sampler import (
+    STAGE1_SOLVER_PROTOCOL,
+    Stage1Sampler,
+    normalized_answer_entropy,
+    prompt_hashes,
+)
 from modules.stage2.contracts import build_learning_bundles
 from modules.stage2.principle_generation import build_generation_prompt
 
@@ -40,8 +45,9 @@ def test_answer_entropy() -> None:
 def test_three_zones_are_primary_and_entropy_cannot_change_them() -> None:
     sampler = Stage1Sampler(["mock"], "mock")
     for correct_count, zone, level in (
-        (10, "master", 0), (0, "panic", 0), (9, "learning", 1),
+        (10, "master", 0), (9, "master", 0), (8, "learning", 1),
         (7, "learning", 2), (4, "learning", 3), (2, "learning", 4),
+        (1, "panic", 0), (0, "panic", 0),
     ):
         records = []
         for index in range(10):
@@ -54,6 +60,48 @@ def test_three_zones_are_primary_and_entropy_cannot_change_them() -> None:
         result = sampler.finalize_result({"planned_trials": 10, "trial_records": records})
         assert result["zone"] == zone
         assert result["assigned_level"] == level
+
+
+def test_stage1_uses_frozen_two_stage_solver_protocol() -> None:
+    sampler = Stage1Sampler(["mock"], "mock")
+    assert STAGE1_SOLVER_PROTOCOL == "solver_v1.1"
+    assert set(prompt_hashes()) == {"reasoner", "finalizer"}
+    assert all(len(value) == 64 for value in prompt_hashes().values())
+    assert sampler.max_tokens == 8192
+    assert sampler.finalizer_max_tokens == 128
+
+
+def test_stage1_two_stage_call_keeps_reasoner_entropy(monkeypatch) -> None:
+    import modules.stage1_sampler as stage1_module
+
+    calls = []
+
+    async def fake_call(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return {
+                "text": "Method:\nAdd.\nReasoning:\n2+2=4.\nCheck:\n4-2=2.",
+                "duration_sec": 1.0,
+                "usage": {"completion_tokens": 12},
+                "entropy": {"available": True, "normalized_entropy": 0.25},
+            }
+        return {
+            "text": r"Final Answer: \boxed{4}",
+            "duration_sec": 0.1,
+            "usage": {"completion_tokens": 6},
+        }
+
+    monkeypatch.setattr(stage1_module, "async_llm_call_with_metadata", fake_call)
+    sampler = Stage1Sampler(["mock://0"], "mock")
+    result = asyncio.run(sampler._single_inference_with_metadata("What is 2+2?", 42))
+
+    assert len(calls) == 2
+    assert calls[0]["request_logprobs"] is True
+    assert calls[1]["request_logprobs"] is False
+    assert calls[1]["temperature"] == 0.0
+    assert result["solver_protocol"] == STAGE1_SOLVER_PROTOCOL
+    assert result["entropy"]["normalized_entropy"] == 0.25
+    assert result["finalizer_output"] == r"Final Answer: \boxed{4}"
 
 
 def test_invalid_input_is_not_misclassified_as_panic() -> None:
@@ -113,7 +161,7 @@ class MockSampler(Stage1Sampler):
 def test_mock_ten_question_end_to_end_and_stage2_contract() -> None:
     async def run():
         sampler = MockSampler()
-        correct_limits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 10]
+        correct_limits = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
         tasks = [
             {"id": f"q{i}", "question": f"mock correct {limit}", "answer": "1", "difficulty_level": "Level 2"}
             for i, limit in enumerate(correct_limits)
@@ -122,19 +170,19 @@ def test_mock_ten_question_end_to_end_and_stage2_contract() -> None:
             checkpoint = str(Path(directory) / "checkpoint.jsonl")
             sampler.task_batch_size = 3
             sampled = await sampler.sample_all(tasks, concurrency=4, checkpoint_path=checkpoint)
-            assert len(sampled["results"]) == 10
+            assert len(sampled["results"]) == 11
             for item in sampled["results"]:
                 assert [record["seed"] for record in item["trial_records"]] == list(range(42, 52))
-            assert sampled["summary"]["master_zone"] == 1
-            assert sampled["summary"]["panic_zone"] == 1
-            assert sampled["summary"]["learning_zone"] == 8
+            assert sampled["summary"]["master_zone"] == 2
+            assert sampled["summary"]["panic_zone"] == 2
+            assert sampled["summary"]["learning_zone"] == 7
             assert sampled["config"]["task_batch_size"] == 3
 
             miner = Stage1Miner(experiment_seed=42, dataset_sha256="testhash")
             mined = await miner.run(sampled["level_data"])
             bundles = [item for values in mined["packets"].values() for item in values]
-            assert len(bundles) == 8
-            assert len({item["question_id"] for item in bundles}) == 8
+            assert len(bundles) == 7
+            assert len({item["question_id"] for item in bundles}) == 7
             assert all(len(item["rollouts"]) == 10 for item in bundles)
 
             output = Path(directory) / "stage1"

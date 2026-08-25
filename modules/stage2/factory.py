@@ -25,8 +25,19 @@ def _save(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
-def _candidate_id(bundle_id: str, family_id: str) -> str:
-    return "candidate_" + hashlib.sha256(f"{bundle_id}:{family_id}".encode()).hexdigest()[:16]
+def _candidate_id(generator_id: str, bundle_id: str, family_id: str) -> str:
+    digest = hashlib.sha256(f"{generator_id}:{bundle_id}:{family_id}".encode()).hexdigest()[:16]
+    return f"{generator_id}_{digest}"
+
+
+def _is_hard_rejection(audit: Dict[str, Any]) -> bool:
+    deterministic = audit.get("deterministic_leakage", {})
+    failed = set(audit.get("failed_dimensions", []))
+    return bool(
+        deterministic.get("detected")
+        or failed.intersection({"source_fidelity", "mathematical_validity", "instance_leakage"})
+        or audit.get("protocol_compliant") is False
+    )
 
 
 def _memory_record(candidate: Dict[str, Any], bundle: Dict[str, Any], round_id: int) -> Dict[str, Any]:
@@ -74,6 +85,7 @@ async def build_level_memory(
     candidate_bank: str = "",
     selection_file: str = "",
     artifact_dir: str = "",
+    generator_id: str = "deepseek",
 ) -> Dict[str, Any]:
     """Build one curriculum level without neighbor-task validation."""
     started = time.monotonic()
@@ -104,8 +116,32 @@ async def build_level_memory(
     run_hash = hashlib.sha256(json.dumps({
         "level": level,
         "bundle_hashes": [item["source_hash"] for item in bundles],
-        "generator": pipeline.config.stage2.generator_model,
+        "generator_id": generator_id,
+        "generator": (
+            pipeline.config.stage2.qwen_generator_model
+            if generator_id == "qwen" else pipeline.config.stage2.generator_model
+        ),
+        "generator_max_tokens": (
+            pipeline.config.stage2.qwen_generation_max_tokens
+            if generator_id == "qwen" else pipeline.config.stage2.generation_max_tokens
+        ),
+        "generator_analysis_max_tokens": (
+            pipeline.config.stage2.qwen_generation_analysis_max_tokens
+            if generator_id == "qwen" else pipeline.config.stage2.generation_analysis_max_tokens
+        ),
+        "generator_retry_max_tokens": (
+            pipeline.config.stage2.qwen_generation_retry_max_tokens
+            if generator_id == "qwen" else None
+        ),
+        "generator_reasoning_effort": (
+            pipeline.config.stage2.qwen_generator_reasoning_effort
+            if generator_id == "qwen" else "provider_default"
+        ),
+        "generator_thinking_enabled": pipeline.config.stage2.generator_thinking_enabled,
+        "generator_synthesis_thinking_enabled": pipeline.config.stage2.generator_synthesis_thinking_enabled,
         "auditor": pipeline.config.stage2.auditor_model,
+        "audit_max_tokens": pipeline.config.stage2.audit_max_tokens,
+        "auditor_thinking_enabled": pipeline.config.stage2.auditor_thinking_enabled,
         "schema": SCHEMA_VERSION,
     }, sort_keys=True).encode("utf-8")).hexdigest()
     checkpoint_path = artifact_root / "checkpoint.json"
@@ -119,13 +155,13 @@ async def build_level_memory(
         if isinstance(summary, dict) and summary.get("run_hash") == run_hash:
             return summary
 
-    client = Stage2ModelClient(pipeline.config)
+    client = Stage2ModelClient(pipeline.config, generator_id=generator_id)
     semaphore = asyncio.Semaphore(max(1, int(model_concurrency)))
     units: List[Dict[str, Any]] = []
 
-    async def process(bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+    async def process(bundle: Dict[str, Any]) -> Dict[str, Any]:
         if validate_learning_bundle(bundle):
-            return []
+            return {"status": "invalid_bundle", "candidates": [], "generation": {}}
         async with semaphore:
             generation = await generate_principles(
                 client, bundle, pipeline.config.stage2.max_principles_per_question
@@ -141,7 +177,8 @@ async def build_level_memory(
                 source_dsd = generated_dsd if isinstance(generated_dsd, dict) else {}
             candidate = {
                 **family,
-                "candidate_id": _candidate_id(bundle["bundle_id"], family["family_id"]),
+                "candidate_id": _candidate_id(generator_id, bundle["bundle_id"], family["family_id"]),
+                "generator_id": generator_id,
                 "question_id": bundle["question_id"],
                 "source_dsd": source_dsd,
                 "generation": generation,
@@ -173,9 +210,24 @@ async def build_level_memory(
                     candidate["content"] = repair["content"]
                     async with semaphore:
                         candidate["quality_audit"] = await audit_principle(client, bundle, candidate)
-            candidate["status"] = "quality_pass" if candidate["quality_audit"]["decision"] == "pass" else "rejected"
+            final_audit = candidate["quality_audit"]
+            candidate["status"] = (
+                "quality_pass" if final_audit["decision"] == "pass" else
+                "hard_rejected" if _is_hard_rejection(final_audit) else
+                "audit_flagged"
+            )
             results.append(candidate)
-        return results
+        if generation.get("finish_reason") == "length" and not generation["families"]:
+            status = "generation_truncated"
+        elif not generation["parse_success"]:
+            status = "generation_parse_failed"
+        elif generation["schema_failures"] and not generation["families"]:
+            status = "generation_schema_failed"
+        elif not generation["families"]:
+            status = "no_generalizable_principle"
+        else:
+            status = "generated"
+        return {"status": status, "candidates": results, "generation": generation}
 
     bank_path = Path(candidate_bank) if candidate_bank else None
     if bank_path and bank_path.exists() and not prepare_candidates_only:
@@ -198,15 +250,46 @@ async def build_level_memory(
                 units.extend(item for item in persisted if isinstance(item, dict))
         pending = [item for item in bundles if item["question_id"] not in completed_ids]
 
-        async def process_with_id(bundle: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
+        generation_dir = artifact_root / "03_generation_results"
+
+        async def process_with_id(bundle: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
             return bundle["question_id"], await process(bundle)
 
         tasks = [asyncio.create_task(process_with_id(bundle)) for bundle in pending]
         for task in asyncio.as_completed(tasks):
             try:
-                question_id, group = await task
-                units.extend(group)
-                completed_ids.add(question_id)
+                question_id, outcome = await task
+                _save(generation_dir / f"{question_id}.json", outcome)
+                generation_trace = outcome.get("generation", {})
+                _save(artifact_root / "01_reasoning" / f"{question_id}.json", {
+                    "question_id": question_id,
+                    "generator_id": generator_id,
+                    "analysis_reasoning": (generation_trace.get("analysis_stage") or {}).get("reasoning", ""),
+                    "analysis_content": (generation_trace.get("analysis_stage") or {}).get("content", ""),
+                    "synthesis_reasoning": generation_trace.get("reasoning_content", ""),
+                    "attempts": generation_trace.get("generation_attempts", []),
+                })
+                _save(artifact_root / "02_final_content" / f"{question_id}.json", {
+                    "question_id": question_id,
+                    "generator_id": generator_id,
+                    "final_content": generation_trace.get("raw_response", ""),
+                    "finish_reason": generation_trace.get("finish_reason"),
+                    "parse_success": generation_trace.get("parse_success", False),
+                    "parse_source": generation_trace.get("parse_source", "message.content"),
+                    "schema_failures": generation_trace.get("schema_failures", []),
+                })
+                units.extend(outcome["candidates"])
+                if outcome["status"] in {"generated", "no_generalizable_principle"}:
+                    completed_ids.add(question_id)
+                    checkpoint["failed_question_ids"] = [
+                        item for item in checkpoint.get("failed_question_ids", [])
+                        if not str(item).startswith(f"{question_id}:")
+                    ]
+                else:
+                    failure = f"{question_id}:{outcome['status']}"
+                    existing_failures = checkpoint.setdefault("failed_question_ids", [])
+                    if failure not in existing_failures:
+                        existing_failures.append(failure)
             except Exception as exc:
                 checkpoint.setdefault("failed_question_ids", []).append(
                     f"{type(exc).__name__}:{exc}"

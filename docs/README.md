@@ -1,12 +1,16 @@
-# MemUA Docs Index
+# ActiveEvo 文档索引
 
-当前和代码保持对齐的主文档只保留 3 份：
+## Stage 2
 
-- [docs/core/ARCHITECTURE.md](/home/czhu/document/ActiveEvo_ICASSP_2027/incoming/code/ActiveEvo_code/docs/core/ARCHITECTURE.md)
-  - 说明现在整份代码的结构、模块职责、关键技术和存储方式
-- [docs/core/PARAMETER_REFERENCE.md](/home/czhu/document/ActiveEvo_ICASSP_2027/incoming/code/ActiveEvo_code/docs/core/PARAMETER_REFERENCE.md)
-  - 汇总当前实际生效的参数、默认值和设置原因
-- [docs/core/STAGE_REPRODUCTION_GUIDE.md](/home/czhu/document/ActiveEvo_ICASSP_2027/incoming/code/ActiveEvo_code/docs/core/STAGE_REPRODUCTION_GUIDE.md)
-  - 按 Stage 给出当前可直接执行的复现与运行方式
+- [Principle 生成、审查与有效性校准流程](STAGE2_PRINCIPLE_QUALITY_CALIBRATION.md)
+  - 当前确认的 Stage 2 目标、条件卡、审查消融、40题校准/确认实验和验收标准。
+- [Memory Factory](STAGE2_MEMORY_FACTORY.md)
+  - 当前代码中的 Stage 2 数据流、主要函数和输出目录。
+- [Stage 2 增量生成与逐轮冻结](STAGE2_INCREMENTAL_FREEZING.md)
+  - 固定40→100→600→全量的嵌套样本、结果复用、质量确认和不可变Release。
 
-本次整理已经删除了明显基于旧代码或与当前实现重复冲突的核心文档，避免后面继续被旧说明误导。
+## 实验结果
+
+- [实验索引](experiments/EXPERIMENTS.md)
+- [Stage 3 Dataset Suite](experiments/STAGE3_DATASET_SUITE_RESULTS.md)
+- [Stage 3 MATH-500](experiments/STAGE3_MATH500_RESULTS.md)
