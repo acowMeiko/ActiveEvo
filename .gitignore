@@ -36,6 +36,7 @@ api_call/logs/
 # Datasets and generated learning artifacts
 data/*
 !data/README.md
+!data/deepscaler_merged_6000.json
 !data/examples/
 !data/examples/**
 learning_packet/
