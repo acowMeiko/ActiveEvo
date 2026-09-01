@@ -5,11 +5,20 @@ import json
 import pytest
 
 from modules.stage2.protocol_calibration import (
+    FORCED_TIMING_FIELDS,
     PROTOCOL_VERSION,
     _decision,
+    _forced_prompt_privacy_violations,
+    _forced_question_effects,
     _format_check,
     _load_prior_protocol_exclusions,
     _parse_audit,
+    render_forced_principle_card,
+)
+from template.prompt_template import (
+    FORCED_TIMING_AFTER_DRAFT_PROMPT,
+    FORCED_TIMING_AFTER_PLAN_PROMPT,
+    FORCED_TIMING_PLAN_PROMPT,
 )
 from modules.stage2.principle_generation import validate_synthesis_payload
 
@@ -140,3 +149,57 @@ def test_prior_protocol_rounds_are_loaded_as_stable_exclusions(tmp_path) -> None
 def test_prior_protocol_exclusion_requires_a_frozen_manifest(tmp_path) -> None:
     with pytest.raises(FileNotFoundError, match="Missing prior protocol manifest"):
         _load_prior_protocol_exclusions([tmp_path / "missing"])
+
+
+def test_forced_timing_card_contains_solver_fields_and_excludes_metadata() -> None:
+    candidate = _candidate()
+    content = candidate["content"]
+    card = render_forced_principle_card(content)
+
+    for field in FORCED_TIMING_FIELDS:
+        value = content[field]
+        if isinstance(value, list):
+            assert all(item in card for item in value)
+        else:
+            assert value in card
+    assert "generalization_level" not in card
+    assert candidate["candidate_id"] not in card
+    assert candidate["question_id"] not in card
+    assert "w1" not in card
+    assert "c1" not in card
+
+
+def test_forced_timing_prompts_share_exact_card_without_ids_or_answers() -> None:
+    candidate = _candidate()
+    card = render_forced_principle_card(candidate["content"])
+    prompts = (
+        FORCED_TIMING_PLAN_PROMPT.format(question="Current question", principle_card=card),
+        FORCED_TIMING_AFTER_PLAN_PROMPT.format(
+            question="Current question", initial_plan="Plan without experience", principle_card=card,
+        ),
+        FORCED_TIMING_AFTER_DRAFT_PROMPT.format(
+            question="Current question", previous_draft="Draft without experience", principle_card=card,
+        ),
+    )
+    assert all(prompt.count(card) == 1 for prompt in prompts)
+    assert all(not _forced_prompt_privacy_violations(prompt, candidate=candidate) for prompt in prompts)
+    assert "at most 220 words" in prompts[0]
+    assert "at most 180 words" in prompts[0]
+
+
+def test_forced_question_effects_macro_aggregates_candidates_per_question() -> None:
+    rows = [
+        {"arm": "a_before_plan", "question_id": "q1", "level": "level2", "delta_correct": 3, "accuracy_delta": 0.3},
+        {"arm": "a_before_plan", "question_id": "q1", "level": "level2", "delta_correct": -2, "accuracy_delta": -0.2},
+        {"arm": "a_before_plan", "question_id": "q2", "level": "level3", "delta_correct": 0, "accuracy_delta": 0.0},
+    ]
+
+    output = _forced_question_effects(rows)
+
+    q1 = next(item for item in output if item["question_id"] == "q1")
+    assert q1["candidate_count"] == 2
+    assert q1["mean_candidate_delta"] == 0.5
+    assert q1["positive_principle_count"] == 1
+    assert q1["negative_principle_count"] == 1
+    assert q1["any_helpful_principle"] is True
+    assert q1["all_principles_harmful"] is False

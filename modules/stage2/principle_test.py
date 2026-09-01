@@ -106,13 +106,15 @@ async def _gather_with_progress(
         total=len(tasks), desc=description, unit=unit, dynamic_ncols=True,
         disable=not interactive, leave=True,
     )
+    completed_count = 0
     try:
         for completed in asyncio.as_completed(tasks):
             index, result = await completed
             results[index] = result
             progress.update(1)
-            if not interactive and (progress.n == 1 or progress.n % 10 == 0):
-                logger.info("[%s] 进度=%d/%d", description, progress.n, len(tasks))
+            completed_count += 1
+            if not interactive and (completed_count == 1 or completed_count % 10 == 0):
+                logger.info("[%s] 进度=%d/%d", description, completed_count, len(tasks))
     except BaseException:
         for task in tasks:
             if not task.done():

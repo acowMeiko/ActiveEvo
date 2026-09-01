@@ -31,22 +31,40 @@ def build_generation_prompt(bundle: Dict[str, Any], max_principles: int) -> str:
         }
         for item in bundle.get("trajectory_pairs", []) if isinstance(item, dict)
     ]
-    return f"""You construct reusable mathematical memories for a weaker solver.
+    return f"""You construct reusable post-draft mathematical memories for a weaker solver.
 
 Analyze ALL rollouts together. First infer the stable success consensus. For every wrong
-rollout, locate its first causal divergence from that consensus. A closest correct rollout
-may be cited as a concrete contrast, but it is not the sole ground truth. Group wrong
-rollouts with the same root cause into at most {max_principles} failure families and produce
-one Principle per family.
+rollout, locate its first consequential error: the earliest step that changes the later
+derivation or answer. Do not mistake a downstream symptom, final wrong answer, formatting
+problem, truncation, or isolated arithmetic slip for the root cause. Cite an exact wrong
+step and contrast it with a successful step. A closest correct rollout is a hint, not the
+sole ground truth. State the valid invariant or method that a later reviewer must preserve.
+
+Group wrong rollouts with the same causal root into at most {max_principles} independent
+failure families. Prefer one well-supported family over several overlapping lessons. Emit
+multiple families only when each is causally independent and supported by at least one
+wrong and one correct rollout. Prefer no Principle over a weak or invented generalization.
 
 Each Principle must be advice, not a theorem or mandatory instruction. Do not copy the
 source answer, source-specific numbers, names, or conclusions. required_evidence must be
 2-5 facts observable directly in the problem statement. trigger_condition must describe
 only pre-solution mathematical structure; it must never say that a solver/rollout already
-made a claim or error. failure_signals must contain 1-4 concrete behaviors observable in
-a draft solution. action_guidance must contain 3-6 executable advisory sentences and
-verification_step 2-4 concrete checks. Neither required_evidence nor verification_step may
+made a claim or error. Express reusable structure through variables, mathematical roles,
+relations, or invariants rather than source constants.
+
+The memory will be used AFTER a solver has produced a complete draft. failure_signals must
+therefore contain 1-4 concrete draft-observable behaviors. action_guidance must contain 3-6
+minimal corrective steps: preserve every valid part of the draft, change only the diagnosed
+step, and never demand a restart merely to follow the Principle. verification_step must
+contain 2-4 answer-independent checks that can be applied to the revised draft. The
+exclusion_condition must explicitly cover cases where the warning sign is absent or the
+draft already passes the verification. Neither required_evidence nor verification_step may
 state the requested answer or a source-only intermediate conclusion.
+
+Bad abstraction: "When the problem contains 7 objects, subtract 2^7."
+Good abstraction: "When assignments to two labeled subsets are counted and both subsets
+must be nonempty, check the overlap of the two empty-subset exclusion events before applying
+inclusion-exclusion."
 
 Output raw JSON only:
 {{
@@ -100,15 +118,26 @@ def build_diagnosis_prompt(bundle: Dict[str, Any], max_principles: int) -> str:
         }
         for item in bundle.get("trajectory_pairs", []) if isinstance(item, dict)
     ]
-    return f"""Analyze evidence for reusable mathematical memories. This is the diagnosis
-stage; a separate synthesis stage will convert your analysis to JSON.
+    return f"""Analyze evidence for reusable post-draft mathematical memories. This is the
+diagnosis stage; a separate synthesis stage will convert your analysis to JSON.
 
-Determine the stable success consensus, the first consequential error in every wrong
-rollout, and at most {max_principles} distinct failure families. For each family identify
-the supporting wrong rollout IDs, contrasting correct rollout IDs, observable trigger,
-required evidence from the problem statement, draft-observable failure signals, exclusion
-conditions, corrective actions, verification checks, scope, and whether the lesson is genuinely generalizable. Do not copy the source answer or
-source-specific payload. Prefer no Principle over an unsupported generalization.
+Work in this order:
+1. Infer the stable success consensus from all correct rollouts and identify the invariant,
+   formula, case split, or valid step that must be preserved.
+2. For every wrong rollout, quote or precisely locate the first consequential error and
+   explain why it changes the downstream derivation. Separate root causes from symptoms.
+3. Contrast each root cause with evidence from at least one correct rollout.
+4. Merge the same cause across wrong rollouts. Keep at most {max_principles} causally
+   independent families and prefer fewer, stronger families.
+5. Decide whether each family can become a source-independent draft-repair rule. Reject
+   formatting failures, truncation, isolated random slips, unsupported mathematics, and
+   lessons that require the source answer or source-only constants.
+
+For each retained family identify supporting wrong rollout IDs, contrasting correct rollout
+IDs, pre-solution structure, required problem facts, exact draft-observable warning signs,
+exclusions, minimal corrective actions, preservation requirements, answer-independent
+verification checks, and scope. Do not solve the question again. Do not copy the source
+answer or source-specific payload. Prefer no Principle over an unsupported generalization.
 
 Question:
 {bundle['question_text']}

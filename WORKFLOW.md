@@ -11,10 +11,16 @@ python pipeline.py stage1 \
   --ports 8100 8101 8102 8103 \
   --resume
 ```
-3. Run Stage 2 sequentially for `level1` through `level4` using one Store.
-4. Inspect each Level's generated Principles, audits, reconciliation decisions,
-   Store commit and snapshot before continuing.
-5. Freeze the final Store and run identical Stage 3 baseline/guided evaluations.
+3. Freeze the 1200-question Stage 2 production manifest and run the nested
+   300-question batch first. The production controller generates Principles,
+   applies the deterministic format check, runs Forced-C source validation,
+   and then spends the bounded Kimi audit budget.
+4. Inspect `batch_0300/report.md` and both Memory branches. Only
+   `pending_transfer_validation` has passed source-effect and content checks;
+   it is still not a claim of cross-question generalization.
+5. After the 300-question batch is accepted, resume the same frozen manifest
+   at 1200 questions. Stage 3 then performs transfer validation and retrieval
+   evaluation on unseen questions.
 
 Stage 1 and Stage 2 may run on another machine. Copy the repository, Stage-1
 input data, `output/stage1`, and the selected `memory/store` snapshot. No code

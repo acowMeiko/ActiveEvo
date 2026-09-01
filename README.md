@@ -9,9 +9,11 @@ Stage 2: trajectory evidence -> Principle -> quality audit -> Memory Store
 Stage 3: SPD retrieval -> runtime gate/adapter -> Solver -> pass@1/pass@3
 ```
 
-Stage 2 does not use Neighbor Validation. A Principle becomes searchable only
-after schema, leakage, source-fidelity and actionability checks. Its downstream
-effect is measured later by Stage 3 paired evaluation.
+Stage 2 does not use Neighbor Validation. It first measures whether each
+Principle improves the source Llama under the frozen post-draft (Forced-C)
+protocol, then uses Kimi only as a content-safety audit. A passed record is
+stored as `pending_transfer_validation`; it is not searchable until Stage 3
+proves transfer to unseen questions.
 
 ## Three-stage workflow
 
@@ -111,152 +113,83 @@ output/stage1/
 - runs/<backbone>/run_manifest.json
 ```
 
-### Stage 2 — Principle generation and Memory Factory
+### Stage 2 — Source-validated Principle production
 
 ```text
-Stage 1 Learning Bundles
-One Bundle contains one question with correct and wrong trajectories
+Frozen Learning Zone (correct@10 = 2..8)
+1258 questions
         |
         v
-Canonical input construction
-build_learning_bundles()
-validate_learning_bundle()
-Required evidence:
-- question and expected answer
-- complete rollout records
-- at least one correct rollout
-- at least one wrong rollout
-- valid trajectory references
+Exclude the 40 protocol-development questions
         |
         v
-Principle Generation
-generate_principles()
-Input:
-- source question
-- all correct and wrong rollouts
-- deterministic trajectory-pairing hints
-
-The Generator first infers:
-- stable success consensus
-- first causal divergence of wrong trajectories
-- 1-3 failure families with similar root causes
-
-The Generator outputs:
-- routing semantics
-  - core_skill
-  - context_constraints
-  - task_objective
-- one candidate Principle per failure family
+Freeze production1200 + reserve18
+First batch300 quotas by original correct@10:
+96 / 52 / 45 / 32 / 26 / 24 / 25
         |
         v
-Canonical Principle Schema Check
-validate_principle_content(require_extended=True)
-Required fields:
-- introspection
-- trigger_condition
-- required_evidence
-- exclusion_condition
-- failure_mode
-- action_guidance
-- verification_step
-- generalization_level
-- scope
-
-Invalid schema or invalid rollout references
--> rejected
+DeepSeek diagnosis (Thinking, 8192 tokens)
+- compare all correct and wrong trajectories
+- locate the first consequential error
+- preserve successful invariants
+- merge equivalent causes; retain at most three independent causes
         |
         v
-Deterministic leakage check
-deterministic_leakage_check()
-Reject source-specific:
-- answer payload
-- copied significant numbers
+DeepSeek synthesis (non-Thinking, 4096 tokens)
+- emit 0-3 canonical Principle JSON records
+- failure_signals must be observable in a completed draft
+- action_guidance makes the smallest relevant correction
+- verification_step cannot depend on the reference answer
         |
         v
-Independent Quality Audit
-audit_principle()
-Judge every dimension separately:
-- source_fidelity
-- instance_leakage, including source-only entities or conclusions
-- trigger_decidability
-- evidence_grounding
-- exclusion_decidability
-- action_executability
-- verification_executability
-- generalization_support
+Deterministic format check only
+- JSON / schema / required fields
+- required_evidence cardinality
+- referenced rollout IDs and their correct/wrong identity
+No heuristic mathematical rejection
         |
         v
-Quality decision
-
-pass
--> quality_pass
-
-repair
--> repair_principle()
--> at most one directed repair
--> run the complete audit again
-
-reject / invalid repaired result
--> rejected and retained in audit artifacts
+Reuse frozen Stage-1 baseline drafts
+Solver-v1.1, temperature=0.7, seeds=42..51
+        |
+        +---------------- Generic control ----------------+
+        |                                                  |
+        v                                                  v
+Generic draft self-check                           Forced-C Principle check
+one shared result/question/seed                    one result/candidate/seed
+        |                                                  |
+        +---------------- paired effect -------------------+
         |
         v
-Derive four Memory views
-build_memory_views()
-
-routing_view
--> three-dimensional indexing and applicability judgment
-
-solver_view
--> lesson / action guidance / verification only
-
-validation_view
--> quality and later validation evidence
-
-audit_view
--> source, schema, generation and traceability records
+source_helpful iff:
+- delta_vs_generic >= 2
+- delta_vs_original >= 0
+- gain_vs_generic > loss_vs_generic
         |
         v
-Reconcile with the cumulative Memory Store
-reconcile_candidate()
-Retrieve only near-equivalent existing memories, then choose:
-- add
-- covered
-- update
-- merge
-- reject
-
-update / merge
--> audit the resulting Principle again
--> failed re-audit becomes reject
+Kimi single blind content audit (helpful candidates only)
+- source fidelity
+- mathematical validity
+- instance/answer leakage
+- decidable conditions
+- executable action and verification
         |
-        v
-Versioned Memory commit
-- append or replace version
-- keep historical versions
-- index only active memories
-- save three facet indices
-- create the Level snapshot
-        |
-        v
-Stage 2 artifacts
-output/stage2/<level>/
-- 00_learning_bundles/
-- 04_generated_principles/
-- 06_quality_audits/
-- 08_memory_reconciliation/
-- checkpoint.json
-- summary.json
+        +-- pass --> pending_transfer_validation
+        +-- hard reject --> content_rejected
+        +-- repair --> DeepSeek repairs once
+                        -> Forced-C pass@10 again
+                        -> Kimi re-audit once
 
-memory/store/
-- active Principle records
-- version history
-- core_skill / context_constraints / task_objective indices
-- Level snapshots
+Non-helpful records remain available for diagnosis:
+- source_harmful
+- inconclusive
+- protocol_failed
+- awaiting_audit
+
+Thirty stable non-helpful candidates receive a bounded Kimi diagnostic sample.
+All records and repairs are append-only. Nothing is searchable before transfer
+validation on unseen questions.
 ```
-
-Stage 2 is a source-evidence and content-quality gate. It does not use Neighbor
-Validation and it does not claim that a quality-approved Principle improves
-accuracy. Positive and negative effects are measured by Stage 3.
 
 ### Stage 3 — Applicability retrieval and paired evaluation
 
@@ -391,11 +324,45 @@ python pipeline.py stage1 \
 # Rebuild the four Stage-1 diagnostic figures without calling a model.
 python scripts/stage1/analyze.py --stage1-dir output/stage1
 
-# Stage 2 cumulatively builds the same Store by curriculum level.
-python pipeline.py stage2 --level level1 --memory-dir memory/store
-python pipeline.py stage2 --level level2 --memory-dir memory/store
-python pipeline.py stage2 --level level3 --memory-dir memory/store
-python pipeline.py stage2 --level level4 --memory-dir memory/store
+# Stage 2 production is recoverable by phase. Prepare is read-only with
+# respect to APIs and freezes the nested 300/1200 manifests.
+python pipeline.py stage2 --mode incremental --incremental-phase prepare \
+  --target-size 300 --backbone llama
+
+# Run the complete first batch. It automatically completes an isolated real
+# two-question Smoke before starting all 300 questions.
+mkdir -p output/stage2/production_1200_v1/batch_0300
+python pipeline.py stage2 \
+  --mode incremental \
+  --incremental-phase complete \
+  --target-size 300 \
+  --backbone llama \
+  --ports 8100 8101 8102 8103 \
+  --model llama \
+  --model-concurrency 8 \
+  --validation-concurrency 8 \
+  --kimi-max-calls 300 \
+  --timeout 900 \
+  --resume \
+  2>&1 | tee output/stage2/production_1200_v1/batch_0300/run.log
+
+# Resume one phase only, or inspect status without calling a model.
+python pipeline.py stage2 --mode incremental --incremental-phase generate \
+  --target-size 300 --backbone llama --model-concurrency 8 --resume
+python pipeline.py stage2 --mode incremental --incremental-phase validate \
+  --target-size 300 --ports 8100 8101 8102 8103 \
+  --model llama --validation-concurrency 8 --resume
+python pipeline.py stage2 --mode incremental --incremental-phase audit-store \
+  --target-size 300 --ports 8100 8101 8102 8103 \
+  --model llama --model-concurrency 8 --validation-concurrency 8 \
+  --kimi-max-calls 300 --resume
+python pipeline.py stage2 --mode incremental --incremental-phase status \
+  --target-size 300
+
+# Progress/log/result locations:
+# output/stage2/production_1200_v1/batch_0300/run.log
+# output/stage2/production_1200_v1/batch_0300/report.md
+# output/stage2/production_1200_v1/batch_0300/memory/
 
 # Isolated 40-source + 40-variant Principle protocol experiment. None of these
 # phases writes to memory/. Run the provider probe and historical dev8 Smoke
@@ -436,21 +403,6 @@ python pipeline.py stage2 --mode principle-test --test-phase robustness \
   --ports 8100 8101 8102 8103 --model llama --validation-concurrency 4
 python pipeline.py stage2 --mode principle-test --test-phase report
 python pipeline.py stage2 --mode principle-test --test-phase status
-
-# After the 40-question protocol is accepted, freeze it once. Later targets
-# reuse all hash-compatible completed questions and call the APIs only for the
-# new delta: 40 -> 100 (+60) -> 600 (+500) -> all.
-python pipeline.py stage2 --mode incremental --incremental-phase freeze \
-  --target-size 40 \
-  --incremental-target-root output/stage2/principle_test_80_v1
-python pipeline.py stage2 --mode incremental --incremental-phase prepare --target-size 100
-python pipeline.py stage2 --mode incremental --incremental-phase run \
-  --target-size 100 --model-concurrency 2
-# Review target_0100 and fill its hash-bound quality_decision.json, then:
-python pipeline.py stage2 --mode incremental --incremental-phase freeze \
-  --target-size 100 \
-  --quality-decision output/stage2/incremental/target_0100/quality_decision.json
-python pipeline.py stage2 --mode incremental --incremental-phase status
 
 # Stage 3 baseline and guided pass@3 evaluation.
 python pipeline.py stage3 --variant baseline

@@ -20,6 +20,7 @@ from pathlib import Path
 from core.agent_pipeline import AgentPipeline
 from core.config import Config
 from modules.memory_module import MemoryModule
+from modules.stage3_snapshot import prepare_transfer_snapshot
 from modules.stage2 import (
     build_level_memory,
     compare_pilot_branches,
@@ -34,6 +35,12 @@ from modules.stage2 import (
     incremental_registry_status,
     prepare_incremental_target,
     run_incremental_candidate_round,
+    audit_and_store_production,
+    generate_production_candidates,
+    prepare_production_target,
+    production_status,
+    run_production_complete,
+    validate_production_candidates,
     build_principle_test_report,
     generate_raw_candidates,
     generate_variants,
@@ -48,8 +55,11 @@ from modules.stage2 import (
     run_transfer_effect_test,
     run_kimi_synthesis_recovery,
     run_role_compare,
+    run_adaptive_tradeoff_compare,
     prepare_l23_protocol,
+    run_forced_timing_compare,
     run_l23_protocol_calibration,
+    run_intervention_compare,
 )
 
 logger = logging.getLogger(__name__)
@@ -228,6 +238,7 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
             "prepare", "probe", "smoke", "variants", "generate", "audit",
             "source", "transfer", "robustness", "report", "status",
             "role-compare", "kimi-synthesis-recovery", "protocol-prepare", "protocol-run",
+            "intervention-compare", "forced-timing-compare", "adaptive-tradeoff-compare",
         ],
         default="status",
         help="Phase of the isolated 40-source/40-variant Principle test.",
@@ -243,14 +254,38 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
             "must be excluded. Repeat this option for multiple prior rounds."
         ),
     )
+    stage2.add_argument(
+        "--protocol-source-root", action="append", default=[],
+        help=(
+            "Completed protocol-calibration root to merge for intervention timing "
+            "comparison. Repeat this option for multiple roots."
+        ),
+    )
+    stage2.add_argument(
+        "--comparison-cache-root", default="",
+        help=(
+            "Completed intervention-compare root containing frozen plans, "
+            "plan-only controls, and generic self-check controls."
+        ),
+    )
+    stage2.add_argument(
+        "--timing-smoke-only", action="store_true",
+        help="Run only two Principle candidates at seeds 42-44; full --resume reuses them.",
+    )
+    stage2.add_argument(
+        "--adaptive-smoke-only", action="store_true",
+        help="Run only two Principle candidates at seeds 42-44 for the adaptive trade-off.",
+    )
     stage2.add_argument("--resume", action="store_true", help="Reuse hash-compatible completed artifacts.")
     stage2.add_argument(
-        "--incremental-phase", choices=["prepare", "run", "freeze", "status"],
-        default="status", help="Manage append-only Stage-2 target rounds.",
+        "--incremental-phase",
+        choices=["prepare", "generate", "validate", "audit-store", "complete", "status"],
+        default="status",
+        help="Run one recoverable phase of the 1200-question Stage-2 production flow.",
     )
     stage2.add_argument(
         "--target-size", default="40",
-        help="Nested Stage-2 target: 40, 100, 600, or all.",
+        help="Nested Stage-2 production target: 300 or 1200 source questions.",
     )
     stage2.add_argument(
         "--registry-root", default="output/stage2/candidate_registry",
@@ -259,6 +294,14 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     stage2.add_argument(
         "--incremental-workspace", default="output/stage2/incremental",
         help="Target manifests and cumulative Candidate Banks.",
+    )
+    stage2.add_argument(
+        "--production-root", default="output/stage2/production_1200_v1",
+        help="Frozen 1200-question manifests, production batches, validation, and Memory outputs.",
+    )
+    stage2.add_argument(
+        "--kimi-max-calls", type=int, default=300,
+        help="Hard total Kimi budget, including helpful audits, reaudits, and 30 diagnostics.",
     )
     stage2.add_argument(
         "--stage2-state-root", default="state/stage2",
@@ -278,6 +321,17 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     stage3.add_argument("--variant", choices=["baseline", "guided"], default="guided")
     stage3.add_argument("--test-file", default=defaults.default_test_file)
     stage3.add_argument("--memory-dir", default=defaults.default_memory_dir)
+    stage3.add_argument(
+        "--pending-memory-store", default="",
+        help=(
+            "Stage-2 pending_transfer_validation JSONL. For guided transfer evaluation, "
+            "an isolated active snapshot is built under --memory-dir."
+        ),
+    )
+    stage3.add_argument(
+        "--generation-records-dir", default="",
+        help="Stage-2 raw_candidates/questions directory containing routing_semantics.",
+    )
     stage3.add_argument("--output-dir", default="")
     stage3.add_argument("--concurrency", type=int, default=defaults.stage3_concurrency)
     stage3.add_argument("--temperature", type=float, default=defaults.default_temperature)
@@ -383,66 +437,63 @@ async def run_stage1(args: argparse.Namespace, config: Config) -> None:
 
 async def run_stage2(args: argparse.Namespace, config: Config) -> None:
     if args.mode == "incremental":
-        target: int | str = (
-            "all" if str(args.target_size).lower() == "all" else int(args.target_size)
-        )
-        registry_root = Path(args.registry_root)
-        workspace_root = Path(args.incremental_workspace)
-        state_root = Path(args.stage2_state_root)
+        target = int(args.target_size)
+        if target not in {300, 1200}:
+            raise ValueError("Stage 2 production target must be 300 or 1200")
+        production_root = Path(args.production_root)
+        target_root = production_root / f"batch_{target:04d}"
         phase = args.incremental_phase
         incremental_phase_zh = {
-            "prepare": "计算可复用题目与新增题目",
-            "run": "只生成并审查本轮缺失题目",
-            "freeze": "质量确认后冻结本轮结果",
-            "status": "查看长期冻结状态",
+            "prepare": "冻结1200题生产池和当前批次",
+            "generate": "DeepSeek生成并执行代码格式检查",
+            "validate": "本地Llama以Forced-C进行来源题验证",
+            "audit-store": "Kimi限额审查、修复重验并分流Memory",
+            "complete": "顺序完成生成、验证、审查和Memory分流",
+            "status": "查看生产批次状态",
         }.get(phase, phase)
         logger.info(
-            "Stage 2增量流程：操作=%s（%s），目标规模=%s，backbone=%s",
+            "Stage 2生产流程：操作=%s（%s），目标规模=%s，backbone=%s",
             incremental_phase_zh, phase, target, args.backbone,
         )
         if phase == "status":
-            result = incremental_registry_status(
-                registry_root=registry_root,
-                state_root=state_root,
-                workspace_root=workspace_root,
+            result = production_status(
+                production_root=production_root, target_size=target,
             )
         elif phase == "prepare":
-            lock_path = state_root / "current_protocol.lock.json"
-            if not lock_path.exists():
-                raise RuntimeError(
-                    "No frozen Stage-2 protocol. Finish and freeze the 40-question calibration first."
-                )
-            result = prepare_incremental_target(
-                config, target=target, workspace_root=workspace_root,
-                registry_root=registry_root, backbone=args.backbone,
-                seed=config.stage2.principle_test_seed,
-                protocol=json.loads(lock_path.read_text(encoding="utf-8")),
+            result = prepare_production_target(
+                config, production_root=production_root,
+                target_size=target, backbone=args.backbone,
             )
-        elif phase == "run":
-            result = await run_incremental_candidate_round(
-                config, target=target, workspace_root=workspace_root,
-                registry_root=registry_root, state_root=state_root,
-                backbone=args.backbone, concurrency=args.model_concurrency,
+        elif phase == "generate":
+            prepare_production_target(
+                config, production_root=production_root,
+                target_size=target, backbone=args.backbone,
+            )
+            result = await generate_production_candidates(
+                config, target_root=target_root, concurrency=args.model_concurrency,
+            )
+        elif phase == "validate":
+            result = await validate_production_candidates(
+                config, target_root=target_root, ports=args.ports,
+                model=args.model, concurrency=args.validation_concurrency,
+                timeout=args.timeout,
+            )
+        elif phase == "audit-store":
+            result = await audit_and_store_production(
+                config, target_root=target_root, ports=args.ports,
+                model=args.model, validation_concurrency=args.validation_concurrency,
+                audit_concurrency=args.model_concurrency, timeout=args.timeout,
+                kimi_max_calls=args.kimi_max_calls,
             )
         else:
-            if str(target).lower() == "all":
-                if not args.incremental_target_root:
-                    raise ValueError("Freezing target=all requires --incremental-target-root")
-                target_root = Path(args.incremental_target_root)
-                manifest = json.loads(
-                    (target_root / "manifests" / "source40.json").read_text(encoding="utf-8")
-                )
-                target_count = len(manifest.get("source_question_ids", []))
-            else:
-                target_count = int(target)
-                target_root = (
-                    Path(args.incremental_target_root) if args.incremental_target_root else
-                    workspace_root / f"target_{target_count:04d}"
-                )
-            result = freeze_stage2_round(
-                config, target_root=target_root, registry_root=registry_root,
-                state_root=state_root, target_count=target_count,
-                quality_decision_path=(Path(args.quality_decision) if args.quality_decision else None),
+            result = await run_production_complete(
+                config, production_root=production_root,
+                target_size=target, backbone=args.backbone,
+                ports=args.ports, model=args.model,
+                generation_concurrency=args.model_concurrency,
+                validation_concurrency=args.validation_concurrency,
+                audit_concurrency=args.model_concurrency,
+                timeout=args.timeout, kimi_max_calls=args.kimi_max_calls,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return
@@ -465,6 +516,9 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
             "kimi-synthesis-recovery": "仅恢复4道Kimi合成截断题",
             "protocol-prepare": "冻结全新Level 2/3共20道协议校准题",
             "protocol-run": "DeepSeek生成、Kimi六维审查与Llama配对验证",
+            "intervention-compare": "40题Principle介入时机对比",
+            "forced-timing-compare": "40题Principle固定注入时机对比",
+            "adaptive-tradeoff-compare": "草稿感知的B/C自适应介入对比",
         }.get(phase, phase)
         logger.info(
             "Stage 2 Principle测试：阶段=%s（%s），结果目录=%s，backbone=%s，模型=%s，"
@@ -539,6 +593,60 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
                 generation_concurrency=args.model_concurrency,
                 validation_concurrency=args.validation_concurrency,
                 timeout=args.timeout,
+            )
+        elif phase == "intervention-compare":
+            if not args.protocol_source_root:
+                raise ValueError(
+                    "intervention-compare requires at least one --protocol-source-root"
+                )
+            result = await run_intervention_compare(
+                config,
+                test_root=root,
+                source_roots=[Path(value) for value in args.protocol_source_root],
+                ports=args.ports,
+                model=args.model,
+                validation_concurrency=args.validation_concurrency,
+                timeout=args.timeout,
+            )
+        elif phase == "forced-timing-compare":
+            if not args.protocol_source_root:
+                raise ValueError(
+                    "forced-timing-compare requires at least one --protocol-source-root"
+                )
+            if not args.comparison_cache_root:
+                raise ValueError(
+                    "forced-timing-compare requires --comparison-cache-root"
+                )
+            result = await run_forced_timing_compare(
+                config,
+                test_root=root,
+                source_roots=[Path(value) for value in args.protocol_source_root],
+                comparison_cache_root=Path(args.comparison_cache_root),
+                ports=args.ports,
+                model=args.model,
+                validation_concurrency=args.validation_concurrency,
+                timeout=args.timeout,
+                smoke_only=args.timing_smoke_only,
+            )
+        elif phase == "adaptive-tradeoff-compare":
+            if not args.protocol_source_root:
+                raise ValueError(
+                    "adaptive-tradeoff-compare requires at least one --protocol-source-root"
+                )
+            if not args.comparison_cache_root:
+                raise ValueError(
+                    "adaptive-tradeoff-compare requires --comparison-cache-root"
+                )
+            result = await run_adaptive_tradeoff_compare(
+                config,
+                test_root=root,
+                source_roots=[Path(value) for value in args.protocol_source_root],
+                comparison_cache_root=Path(args.comparison_cache_root),
+                ports=args.ports,
+                model=args.model,
+                validation_concurrency=args.validation_concurrency,
+                timeout=args.timeout,
+                smoke_only=args.adaptive_smoke_only,
             )
         elif phase == "report":
             result = build_principle_test_report(root)
@@ -697,6 +805,18 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
 async def run_stage3(args: argparse.Namespace, config: Config) -> None:
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir(config, args.variant)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.variant == "guided" and args.pending_memory_store:
+        if not args.generation_records_dir:
+            raise ValueError("--generation-records-dir is required with --pending-memory-store")
+        snapshot = prepare_transfer_snapshot(
+            pending_store=args.pending_memory_store,
+            generation_dir=args.generation_records_dir,
+            snapshot_dir=args.memory_dir,
+        )
+        logger.info(
+            "Stage 3迁移评测快照已准备：%d条Memory，原Store保持pending状态，快照=%s",
+            snapshot["memory_count"], args.memory_dir,
+        )
     command = [
         _python_executable(),
         "scripts/stage3/evaluate.py",

@@ -15,15 +15,26 @@ from modules.stage2.pilot_runner import (
 )
 from modules.stage2.source_validation import validate_source_principles
 from modules.stage2.role_compare import run_kimi_synthesis_recovery, run_role_compare
+from modules.stage2.adaptive_tradeoff import run_adaptive_tradeoff_compare
 from modules.stage2.protocol_calibration import (
     prepare_l23_protocol,
+    run_forced_timing_compare,
     run_l23_protocol_calibration,
+    run_intervention_compare,
 )
 from modules.stage2.incremental_registry import (
     freeze_stage2_round,
     incremental_registry_status,
     prepare_incremental_target,
     run_incremental_candidate_round,
+)
+from modules.stage2.production_pipeline import (
+    audit_and_store_production,
+    generate_production_candidates,
+    prepare_production_target,
+    production_status,
+    run_production_complete,
+    validate_production_candidates,
 )
 from modules.stage2.principle_test import (
     build_principle_test_report,
@@ -52,12 +63,21 @@ __all__ = [
     "validate_source_principles",
     "run_role_compare",
     "run_kimi_synthesis_recovery",
+    "run_adaptive_tradeoff_compare",
     "prepare_l23_protocol",
+    "run_forced_timing_compare",
     "run_l23_protocol_calibration",
+    "run_intervention_compare",
     "freeze_stage2_round",
     "incremental_registry_status",
     "prepare_incremental_target",
     "run_incremental_candidate_round",
+    "prepare_production_target",
+    "generate_production_candidates",
+    "validate_production_candidates",
+    "audit_and_store_production",
+    "run_production_complete",
+    "production_status",
     "prepare_principle_test",
     "run_provider_probe",
     "run_principle_test_smoke",

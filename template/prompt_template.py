@@ -245,6 +245,135 @@ Proposed reasoning:
 '''
 
 
+# ==================== Forced Principle timing prompts ====================
+#
+# These prompts deliberately expose the same immutable Principle card at
+# exactly one point in a solve.  They are isolated from Solver-v1.1 so the
+# historical baseline and control artifacts remain readable and unchanged.
+
+FORCED_TIMING_PLAN_PROMPT = r'''
+You are preparing a concise mathematical solution plan. Do not solve the
+problem and do not state a provisional or final answer.
+
+A candidate reasoning Principle is supplied below. Read every field. Use it
+only to improve the plan: add necessary safeguards, missing operations, case
+splits, or verification steps. Do not copy a result from the Principle.
+
+Output exactly these sections:
+
+Principle Processing:
+incorporated_preventively | checked_no_change — [brief explanation, at most 40 words]
+
+Problem Structure:
+[mathematical structure]
+
+Target:
+[what must be derived]
+
+Constraints:
+[important conditions]
+
+Planned Method:
+[one coherent method]
+
+Ordered Steps:
+1. ...
+2. ...
+
+Critical Checks:
+- ...
+
+Keep the mathematical plan at most 180 words. Keep the complete response at most 220 words.
+Do not perform the full calculation.
+
+Current Problem:
+{question}
+
+Reasoning Principle:
+{principle_card}
+'''
+
+
+FORCED_TIMING_AFTER_PLAN_PROMPT = r'''
+You are solving a mathematical problem from a previously prepared plan.
+
+The initial plan was written without access to the Principle. Read the full
+Principle now. Preserve valid parts of the plan, but correct or strengthen its
+execution where the Principle identifies a missing condition, dangerous
+shortcut, or necessary verification.
+
+The Principle is procedural guidance, not evidence and not a known answer.
+Derive every result from the current problem. Do not restart or repeat the
+solution, and do not state or box the final answer; a separate finalizer will
+do that.
+
+Output exactly these sections:
+
+Principle Processing:
+integrated_during_execution | checked_no_change — [brief explanation]
+
+Method:
+[one sentence]
+
+Reasoning:
+[a compact complete derivation]
+
+Check:
+[one direct verification]
+
+Current Problem:
+{question}
+
+Initial Plan:
+{initial_plan}
+
+Reasoning Principle:
+{principle_card}
+'''
+
+
+FORCED_TIMING_AFTER_DRAFT_PROMPT = r'''
+You are reviewing a complete mathematical draft that was produced without
+access to the Principle.
+
+Use the Principle as a targeted error-checking procedure. Compare the draft's
+actual steps with the Principle's failure pattern, warning signs, required
+evidence, corrective procedure, and verification procedure.
+
+If the draft is valid, retain its reasoning and state that no correction was
+needed. If a concrete error is found, identify the exact faulty step and
+produce a corrected derivation. Do not replace a valid draft merely to follow
+the Principle. Do not ignore the draft and start a random new solution. Do not
+state or box the final answer; a separate finalizer will do that.
+
+Output exactly these sections:
+
+Principle Processing:
+corrected_draft | verified_no_change — [specific reason]
+
+Draft Assessment:
+[the exact checked step or issue]
+
+Revised Method:
+[method]
+
+Revised Reasoning:
+[complete corrected or retained derivation]
+
+Verification:
+[direct verification]
+
+Current Problem:
+{question}
+
+Previous Draft:
+{previous_draft}
+
+Reasoning Principle:
+{principle_card}
+'''
+
+
 BASELINE_TEST_PROMPT = '''
 You are an expert mathematical problem solver.
 
