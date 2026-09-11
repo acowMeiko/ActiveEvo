@@ -4,6 +4,7 @@ models/actor/*
 models/generator/*
 models/auditor/*
 models/embedding/*
+models/reranker/*
 !models/actor/.gitkeep
 !models/generator/.gitkeep
 !models/auditor/.gitkeep

@@ -335,21 +335,25 @@ class PlanModule:
                 seen.add(c)
         return deduped
 
-    def _extract_json(self, text: str, task: str = "generic") -> Optional[Dict[str, Any]]:
+    def _extract_json_value(self, text: str) -> Any:
+        """Return the first complete JSON object or array without shape coercion."""
         for candidate in self._json_candidates(text):
             for variant in [candidate, _clean_json_string(candidate)]:
                 try:
-                    parsed = json.loads(variant)
+                    return json.loads(variant)
                 except Exception:
                     continue
-                if not isinstance(parsed, dict):
-                    continue
-                if task == "diff":
-                    return _normalize_diff_fields(parsed)
-                if task == "principle":
-                    return _normalize_principle_fields(parsed)
-                return parsed
         return None
+
+    def _extract_json(self, text: str, task: str = "generic") -> Optional[Dict[str, Any]]:
+        parsed = self._extract_json_value(text)
+        if not isinstance(parsed, dict):
+            return None
+        if task == "diff":
+            return _normalize_diff_fields(parsed)
+        if task == "principle":
+            return _normalize_principle_fields(parsed)
+        return parsed
 
     def _extract_gate_json(self, text: str) -> tuple[Optional[Dict[str, Any]], str]:
         """Normalize the two common Gate response shapes without losing auditability.
@@ -359,18 +363,13 @@ class PlanModule:
         executable after normalization; ``parse_stage`` records which shape was
         actually returned so protocol compliance remains measurable.
         """
-        for candidate in self._json_candidates(text):
-            for variant in (candidate, _clean_json_string(candidate)):
-                try:
-                    parsed = json.loads(variant)
-                except Exception:
-                    continue
-                if isinstance(parsed, dict) and isinstance(parsed.get("judgments"), list):
-                    return parsed, "wrapped_object"
-                if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
-                    return {"judgments": parsed}, "direct_list_normalized"
-                if isinstance(parsed, dict) and parsed.get("memory_id"):
-                    return {"judgments": [parsed]}, "single_judgment_normalized"
+        parsed = self._extract_json_value(text)
+        if isinstance(parsed, dict) and isinstance(parsed.get("judgments"), list):
+            return parsed, "wrapped_object"
+        if isinstance(parsed, list) and all(isinstance(item, dict) for item in parsed):
+            return {"judgments": parsed}, "direct_list_normalized"
+        if isinstance(parsed, dict) and parsed.get("memory_id"):
+            return {"judgments": [parsed]}, "single_judgment_normalized"
         return None, "parse_failed"
 
     def _extract_stage2_principle_json(self, text: str) -> tuple[Optional[Dict[str, Any]], str]:

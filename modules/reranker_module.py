@@ -5,7 +5,7 @@ import logging
 from typing import Any, Dict, List, Sequence
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoModelForSequenceClassification, AutoTokenizer
 
 from modules.principle_schema import build_memory_views
 
@@ -134,3 +134,116 @@ class QwenApplicabilityReranker:
             ranked.append(record)
         ranked.sort(key=lambda item: item["rerank_score"], reverse=True)
         return ranked[:top_k] if top_k is not None else ranked
+
+
+class BGECrossEncoderReranker:
+    """Lightweight BGE cross-encoder for structured Memory relevance ranking."""
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        device: str = "cpu",
+        max_length: int = 1024,
+        batch_size: int = 16,
+    ) -> None:
+        self.device = torch.device(device)
+        self.max_length = int(max_length)
+        self.batch_size = max(1, int(batch_size))
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True)
+        dtype = torch.float16 if self.device.type == "cuda" else torch.float32
+        self.model = AutoModelForSequenceClassification.from_pretrained(
+            model_path,
+            dtype=dtype,
+            local_files_only=True,
+        ).to(self.device).eval()
+        logger.info("BGE cross-encoder loaded from %s on %s", model_path, self.device)
+
+    @staticmethod
+    def query_text(question: str, semantics: Dict[str, Any]) -> str:
+        return "\n".join(
+            [
+                f"Problem: {question}",
+                f"Core skill: {semantics.get('core_skill', semantics.get('core_math_concept', ''))}",
+                f"Constraints: {semantics.get('context_constraints', semantics.get('conditions_structure', ''))}",
+                f"Objective: {semantics.get('task_objective', semantics.get('solution_target', ''))}",
+            ]
+        )
+
+    @staticmethod
+    def document_text(candidate: Dict[str, Any]) -> str:
+        content = candidate.get("content", {})
+        retrieval = candidate.get("retrieval", {})
+        item = retrieval.get("item", {}) if isinstance(retrieval, dict) else {}
+        source = {
+            "core_skill": item.get("core_skill", item.get("core_math_concept", "")),
+            "context_constraints": item.get("context_constraints", item.get("conditions_structure", "")),
+            "task_objective": item.get("task_objective", item.get("solution_target", "")),
+        }
+        evidence = content.get("required_evidence", [])
+        signals = content.get("failure_signals", [])
+        if isinstance(evidence, str):
+            evidence = [evidence]
+        if isinstance(signals, str):
+            signals = [signals]
+        return "\n".join(
+            [
+                f"Source core skill: {source['core_skill']}",
+                f"Source constraints: {source['context_constraints']}",
+                f"Source objective: {source['task_objective']}",
+                f"Trigger: {content.get('trigger_condition', '')}",
+                f"Required evidence: {'; '.join(map(str, evidence))}",
+                f"Reject when: {content.get('exclusion_condition', '')}",
+                f"Scope: {content.get('scope', '')}",
+                f"Failure mode: {content.get('failure_mode', '')}",
+                f"Failure signals: {'; '.join(map(str, signals))}",
+                f"Action: {content.get('action_guidance', '')}",
+                f"Verification: {content.get('verification_step', '')}",
+            ]
+        )
+
+    @torch.inference_mode()
+    def score(
+        self,
+        question: str,
+        semantics: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+    ) -> List[float]:
+        query = self.query_text(question, semantics)
+        documents = [self.document_text(candidate) for candidate in candidates]
+        scores: List[float] = []
+        for start in range(0, len(documents), self.batch_size):
+            batch = documents[start:start + self.batch_size]
+            encoded = self.tokenizer(
+                [query] * len(batch),
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self.device) for key, value in encoded.items()}
+            logits = self.model(**encoded).logits.float().reshape(-1)
+            scores.extend(torch.sigmoid(logits).cpu().tolist())
+        return scores
+
+    def rank(
+        self,
+        question: str,
+        semantics: Dict[str, Any],
+        candidates: Sequence[Dict[str, Any]],
+        *,
+        top_k: int,
+    ) -> List[Dict[str, Any]]:
+        probabilities = self.score(question, semantics, candidates)
+        ranked = []
+        for candidate, probability in zip(candidates, probabilities):
+            row = dict(candidate)
+            row["rerank_score"] = float(probability)
+            row["pre_rerank_score"] = float(row.get("score", 0.0))
+            row["score"] = float(probability)
+            row["retrieval_score"] = float(probability)
+            row["retrieval_method"] = "bge_cross_encoder"
+            ranked.append(row)
+        ranked.sort(key=lambda row: (row["rerank_score"], row["pre_rerank_score"]), reverse=True)
+        return ranked[: max(0, int(top_k))]

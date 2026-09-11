@@ -60,6 +60,10 @@ from modules.stage2 import (
     run_forced_timing_compare,
     run_l23_protocol_calibration,
     run_intervention_compare,
+    qwen_recovery_monitor,
+    qwen_recovery_status,
+    recover_qwen_generation,
+    run_kimi_quality_sample,
 )
 
 logger = logging.getLogger(__name__)
@@ -279,7 +283,10 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     stage2.add_argument("--resume", action="store_true", help="Reuse hash-compatible completed artifacts.")
     stage2.add_argument(
         "--incremental-phase",
-        choices=["prepare", "generate", "validate", "audit-store", "complete", "status"],
+        choices=[
+            "prepare", "generate", "recover-generate", "sample-audit",
+            "validate", "audit-store", "complete", "status",
+        ],
         default="status",
         help="Run one recoverable phase of the 1200-question Stage-2 production flow.",
     )
@@ -300,8 +307,31 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
         help="Frozen 1200-question manifests, production batches, validation, and Memory outputs.",
     )
     stage2.add_argument(
-        "--kimi-max-calls", type=int, default=300,
-        help="Hard total Kimi budget, including helpful audits, reaudits, and 30 diagnostics.",
+        "--kimi-max-calls", type=int, default=90,
+        help="Kimi hard total budget: 80 sampled first audits plus at most 10 reaudits.",
+    )
+    stage2.add_argument(
+        "--recovery-limit", type=int, default=0,
+        help=(
+            "Qwen恢复清单的确定性前缀；8用于Smoke，30用于人工质量门槛，"
+            "0表示在30条通过后恢复全部。"
+        ),
+    )
+    stage2.add_argument(
+        "--kimi-audit-sample-size", type=int, default=80,
+        help="全部生成完成后，按生成器×Level分层抽取的Kimi审查数量。",
+    )
+    stage2.add_argument(
+        "--kimi-initial-audit-limit", type=int, default=80,
+        help="Maximum stratified source-helpful Principles audited by Kimi once.",
+    )
+    stage2.add_argument(
+        "--kimi-reaudit-limit", type=int, default=10,
+        help="Maximum repaired, still-helpful Principles reaudited by Kimi.",
+    )
+    stage2.add_argument(
+        "--kimi-diagnostic-limit", type=int, default=0,
+        help="Diagnostic Kimi calls on non-helpful candidates; disabled by default.",
     )
     stage2.add_argument(
         "--stage2-state-root", default="state/stage2",
@@ -318,6 +348,10 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
     _add_common_runtime_args(stage2, config)
 
     stage3 = subparsers.add_parser("stage3", help="Evaluate baseline or memory-guided solving.")
+    stage3.add_argument(
+        "--mode", choices=["evaluate", "retrieval-compare", "semantic-hybrid", "postdraft-transfer"], default="evaluate",
+        help="Run normal evaluation, retrieval experiments, or strict post-draft transfer.",
+    )
     stage3.add_argument("--variant", choices=["baseline", "guided"], default="guided")
     stage3.add_argument("--test-file", default=defaults.default_test_file)
     stage3.add_argument("--memory-dir", default=defaults.default_memory_dir)
@@ -332,13 +366,90 @@ def build_parser(config: Config) -> argparse.ArgumentParser:
         "--generation-records-dir", default="",
         help="Stage-2 raw_candidates/questions directory containing routing_semantics.",
     )
+    stage3.add_argument(
+        "--exploratory-inconclusive-root", default="",
+        help=(
+            "Optional Stage-2 batch root. Adds only format-valid inconclusive candidates "
+            "with zero generic-control loss and no original-baseline regression to an "
+            "isolated evaluation snapshot. The source Store is not modified."
+        ),
+    )
+    stage3.add_argument(
+        "--expected-exploratory-count", type=int, default=None,
+        help="Fail closed unless the exploratory selection contains exactly this many candidates.",
+    )
     stage3.add_argument("--output-dir", default="")
     stage3.add_argument("--concurrency", type=int, default=defaults.stage3_concurrency)
     stage3.add_argument("--temperature", type=float, default=defaults.default_temperature)
+    stage3.add_argument(
+        "--seeds", type=int, nargs="+", default=list(defaults.default_seeds),
+        help="Independent Stage-3 rollout seeds; default is 42 43 44.",
+    )
     stage3.add_argument("--threshold", type=float, default=defaults.stage3_threshold)
     stage3.add_argument("--candidate-top-k", type=int, default=defaults.stage3_candidate_top_k)
     stage3.add_argument("--gate-top-k", type=int, default=defaults.stage3_gate_top_k)
     stage3.add_argument("--max-injected", type=int, default=defaults.stage3_max_injected)
+    stage3.add_argument(
+        "--retrieval-protocol",
+        choices=[
+            "all", "r0_single_vector", "r1_current_three_facet",
+            "r2_strict_three_facet", "r3_hierarchical_three_facet",
+            "r4_draft_verified", "r5_dual_retrieval",
+            "e0_r3_current", "e1_r3_source_dedup", "e2_three_facet_high_recall",
+            "e3_cross_encoder", "h1_dense_sparse", "h2_dense_sparse_multivector",
+            "h3_draft_soft_rerank",
+        ],
+        default="all",
+        help="Protocol selection for --mode retrieval-compare.",
+    )
+    stage3.add_argument(
+        "--retrieval-phase", choices=["parser-replay", "smoke", "calibration", "heldout", "all", "report"],
+        default="all", help="Execution phase for --mode retrieval-compare.",
+    )
+    stage3.add_argument(
+        "--current-guided-dir", default="",
+        help="Existing current-three-facet Stage-3 result used to construct the enriched calibration split.",
+    )
+    stage3.add_argument(
+        "--stage1-packets-root", default="output/stage1/02_learning_packets",
+        help="Stage-1 packet root used to recover Memory source-question text for the single-vector control.",
+    )
+    stage3.add_argument("--source-comparison-root", default="output/stage3/retrieval_protocol_compare_v1")
+    stage3.add_argument("--facet-pool-k", type=int, default=30)
+    stage3.add_argument("--rerank-top-k", type=int, default=12)
+    stage3.add_argument("--reranker-model-path", default="models/reranker/bge-reranker-v2-m3")
+    stage3.add_argument("--reranker-device", default="cpu")
+    stage3.add_argument(
+        "--postdraft-phase", choices=["smoke", "calibration", "heldout", "all"],
+        default="all", help="Execution phase for --mode postdraft-transfer.",
+    )
+    stage3.add_argument(
+        "--memory-arm", choices=["172", "264", "both"], default="both",
+        help="Frozen Memory snapshot(s) evaluated by postdraft-transfer.",
+    )
+    stage3.add_argument("--memory-172-dir", default="")
+    stage3.add_argument("--memory-264-dir", default="")
+    stage3.add_argument(
+        "--split-root", default="output/stage3/retrieval_protocol_compare_v1",
+        help="Directory containing calibration_100.json, heldout_300.json and frozen query semantics.",
+    )
+    stage3.add_argument("--hybrid-model-path", default="/home/share/models/modelscope/BAAI/bge-m3")
+    stage3.add_argument("--hybrid-device", default="cpu")
+    stage3.add_argument("--rrf-rank-constant", type=int, default=60)
+    stage3.add_argument("--draft-structure-weight", type=float, default=0.70)
+    stage3.add_argument("--draft-error-weight", type=float, default=0.30)
+    stage3.add_argument(
+        "--guided-protocol",
+        choices=["pre_solve", "after_draft"],
+        default="pre_solve",
+        help="Guided intervention protocol. after_draft matches Stage-2 Forced-C validation.",
+    )
+    stage3.add_argument(
+        "--baseline-cache-dir",
+        default="",
+        help="Optional Stage-3 baseline output dir for reusing same-seed drafts in after_draft guided evaluation.",
+    )
+    stage3.add_argument("--resume", action="store_true", help="Accepted for command compatibility; Stage 3 resumes from eval_results.json automatically.")
     stage3.add_argument("--limit", type=int, default=0, help="Smoke-test prefix size.")
     _add_common_runtime_args(stage3, config)
 
@@ -446,6 +557,8 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
         incremental_phase_zh = {
             "prepare": "冻结1200题生产池和当前批次",
             "generate": "DeepSeek生成并执行代码格式检查",
+            "recover-generate": "Qwen补齐DeepSeek异常题并构建混合Candidate Bank",
+            "sample-audit": "Kimi对完整混合Bank进行分层抽样质量估计",
             "validate": "本地Llama以Forced-C进行来源题验证",
             "audit-store": "Kimi限额审查、修复重验并分流Memory",
             "complete": "顺序完成生成、验证、审查和Memory分流",
@@ -456,9 +569,12 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
             incremental_phase_zh, phase, target, args.backbone,
         )
         if phase == "status":
-            result = production_status(
-                production_root=production_root, target_size=target,
-            )
+            result = {
+                "production": production_status(
+                    production_root=production_root, target_size=target,
+                ),
+                "qwen_recovery": qwen_recovery_status(target_root),
+            }
         elif phase == "prepare":
             result = prepare_production_target(
                 config, production_root=production_root,
@@ -471,6 +587,33 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
             )
             result = await generate_production_candidates(
                 config, target_root=target_root, concurrency=args.model_concurrency,
+                reuse_roots=(production_root / "batch_0300",) if target == 1200 else (),
+            )
+        elif phase == "recover-generate":
+            if target != 1200:
+                raise ValueError("Qwen恢复只适用于冻结的1200题生产批次")
+            if args.generator != "qwen":
+                raise ValueError("recover-generate必须显式指定 --generator qwen")
+            if args.recovery_limit == 0:
+                gate = qwen_recovery_monitor(target_root, expected_count=30)
+                if not gate["passed"]:
+                    raise RuntimeError(
+                        "尚未通过累计30条Qwen质量门槛；请先使用 "
+                        "--recovery-limit 8，再使用 --recovery-limit 30，并检查monitor_0030.json"
+                    )
+            result = await recover_qwen_generation(
+                config, target_root=target_root,
+                concurrency=args.model_concurrency,
+                limit=args.recovery_limit,
+            )
+        elif phase == "sample-audit":
+            if target != 1200:
+                raise ValueError("Kimi分层抽样只适用于完整1200题生产批次")
+            result = await run_kimi_quality_sample(
+                config, target_root=target_root,
+                sample_size=args.kimi_audit_sample_size,
+                concurrency=args.model_concurrency,
+                max_calls=args.kimi_max_calls,
             )
         elif phase == "validate":
             result = await validate_production_candidates(
@@ -484,6 +627,9 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
                 model=args.model, validation_concurrency=args.validation_concurrency,
                 audit_concurrency=args.model_concurrency, timeout=args.timeout,
                 kimi_max_calls=args.kimi_max_calls,
+                initial_audit_limit=args.kimi_initial_audit_limit,
+                reaudit_limit=args.kimi_reaudit_limit,
+                diagnostic_sample_size=args.kimi_diagnostic_limit,
             )
         else:
             result = await run_production_complete(
@@ -494,6 +640,9 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
                 validation_concurrency=args.validation_concurrency,
                 audit_concurrency=args.model_concurrency,
                 timeout=args.timeout, kimi_max_calls=args.kimi_max_calls,
+                kimi_initial_audit_limit=args.kimi_initial_audit_limit,
+                kimi_reaudit_limit=args.kimi_reaudit_limit,
+                kimi_diagnostic_limit=args.kimi_diagnostic_limit,
             )
         print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
         return
@@ -805,6 +954,66 @@ async def run_stage2(args: argparse.Namespace, config: Config) -> None:
 async def run_stage3(args: argparse.Namespace, config: Config) -> None:
     output_dir = Path(args.output_dir) if args.output_dir else _default_output_dir(config, args.variant)
     output_dir.mkdir(parents=True, exist_ok=True)
+    if args.mode == "postdraft-transfer":
+        if not args.baseline_cache_dir:
+            raise ValueError("--baseline-cache-dir is required for postdraft-transfer")
+        if args.memory_arm in {"172", "both"} and not args.memory_172_dir:
+            raise ValueError("--memory-172-dir is required for the selected Memory arm")
+        if args.memory_arm in {"264", "both"} and not args.memory_264_dir:
+            raise ValueError("--memory-264-dir is required for the selected Memory arm")
+        from modules.stage3_postdraft import run_postdraft_transfer
+        logger.info(
+            "Stage 3草稿后严格验证启动：阶段=%s，Memory=%s，输出=%s",
+            args.postdraft_phase, args.memory_arm, output_dir,
+        )
+        summary = await run_postdraft_transfer(config, args)
+        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+        return
+    if args.mode in {"retrieval-compare", "semantic-hybrid"}:
+        if not args.baseline_cache_dir:
+            raise ValueError("--baseline-cache-dir is required for retrieval comparison")
+        if not args.current_guided_dir:
+            raise ValueError("--current-guided-dir is required for retrieval comparison")
+        command = [
+            _python_executable(),
+            "scripts/stage3/retrieval_compare.py",
+            "--memory-dir", args.memory_dir,
+            "--baseline-cache-dir", args.baseline_cache_dir,
+            "--current-guided-dir", args.current_guided_dir,
+            "--stage1-packets-root", args.stage1_packets_root,
+            "--output-dir", str(output_dir),
+            "--ports", *[str(port) for port in args.ports],
+            "--model", args.model,
+            "--concurrency", str(args.concurrency),
+            "--phase", args.retrieval_phase,
+            "--protocol", args.retrieval_protocol,
+            "--suite", "semantic-hybrid" if args.mode == "semantic-hybrid" else "legacy",
+            "--source-comparison-root", args.source_comparison_root,
+            "--facet-pool-k", str(args.facet_pool_k),
+            "--candidate-top-k", str(args.candidate_top_k),
+            "--rerank-top-k", str(args.rerank_top_k),
+            "--gate-top-k", str(args.gate_top_k),
+            "--max-injected", str(args.max_injected),
+            "--reranker-model-path", args.reranker_model_path,
+            "--reranker-device", args.reranker_device,
+            "--hybrid-model-path", args.hybrid_model_path,
+            "--hybrid-device", args.hybrid_device,
+            "--rrf-rank-constant", str(args.rrf_rank_constant),
+            "--draft-structure-weight", str(args.draft_structure_weight),
+            "--draft-error-weight", str(args.draft_error_weight),
+        ]
+        if args.resume:
+            command.append("--resume")
+        logger.info(
+            "Stage 3检索协议实验启动：阶段=%s，协议=%s，输出=%s",
+            args.retrieval_phase, args.retrieval_protocol, output_dir,
+        )
+        process = await asyncio.create_subprocess_exec(*command, env=subprocess_environment(config))
+        return_code = await process.wait()
+        if return_code != 0:
+            raise RuntimeError(f"Stage 3 retrieval comparison failed with exit code {return_code}")
+        logger.info("Stage 3检索协议实验完成：%s", output_dir / "report.md")
+        return
     if args.variant == "guided" and args.pending_memory_store:
         if not args.generation_records_dir:
             raise ValueError("--generation-records-dir is required with --pending-memory-store")
@@ -812,10 +1021,13 @@ async def run_stage3(args: argparse.Namespace, config: Config) -> None:
             pending_store=args.pending_memory_store,
             generation_dir=args.generation_records_dir,
             snapshot_dir=args.memory_dir,
+            exploratory_batch_root=args.exploratory_inconclusive_root or None,
+            expected_exploratory_count=args.expected_exploratory_count,
         )
         logger.info(
-            "Stage 3迁移评测快照已准备：%d条Memory，原Store保持pending状态，快照=%s",
-            snapshot["memory_count"], args.memory_dir,
+            "Stage 3迁移评测快照已准备：共%d条（正收益审查通过=%d，严格无loss暂无结论=%d），原Store不变，快照=%s",
+            snapshot["memory_count"], snapshot["validated_memory_count"],
+            snapshot["exploratory_memory_count"], args.memory_dir,
         )
     command = [
         _python_executable(),
@@ -834,6 +1046,8 @@ async def run_stage3(args: argparse.Namespace, config: Config) -> None:
         str(args.concurrency),
         "--temperature",
         str(args.temperature),
+        "--seeds",
+        *[str(seed) for seed in args.seeds],
         "--threshold",
         str(args.threshold),
         "--candidate-top-k",
@@ -842,7 +1056,11 @@ async def run_stage3(args: argparse.Namespace, config: Config) -> None:
         str(args.gate_top_k),
         "--max-injected",
         str(args.max_injected),
+        "--guided-protocol",
+        args.guided_protocol,
     ]
+    if args.baseline_cache_dir:
+        command.extend(["--baseline-cache-dir", args.baseline_cache_dir])
     if args.variant == "guided":
         command.extend(["--memory-dir", args.memory_dir])
     if args.limit:
@@ -904,16 +1122,28 @@ async def run_all(args: argparse.Namespace, config: Config) -> None:
 
     stage3_args = argparse.Namespace(
         command="stage3",
+        mode="evaluate",
         variant="guided",
         test_file=args.test_file,
         memory_dir=args.memory_dir,
+        pending_memory_store="",
+        generation_records_dir="",
+        exploratory_inconclusive_root="",
+        expected_exploratory_count=None,
         output_dir="",
         concurrency=args.eval_concurrency,
         temperature=config.pipeline.default_temperature,
+        seeds=list(config.pipeline.default_seeds),
         threshold=args.threshold,
         candidate_top_k=args.top_k,
         gate_top_k=config.pipeline.stage3_gate_top_k,
         max_injected=config.pipeline.stage3_max_injected,
+        retrieval_protocol="all",
+        retrieval_phase="all",
+        current_guided_dir="",
+        stage1_packets_root="output/stage1/02_learning_packets",
+        guided_protocol="pre_solve",
+        baseline_cache_dir="",
         limit=0,
         ports=args.ports,
         model=args.model,

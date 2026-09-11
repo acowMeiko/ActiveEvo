@@ -30,6 +30,8 @@ torch==2.8.0
 transformers>=4.57,<4.58
 sentence-transformers>=5.2,<5.3
 huggingface-hub>=0.36,<0.37
+# Required only by the Stage-3 BGE-M3 dense/sparse/multi-vector ablation.
+FlagEmbedding>=1.3.5,<1.4
 
 # Dataset preparation. Pin fsspec to the compatibility range required by
 # datasets 4.0; a newer globally installed fsspec causes `pip check` failures.

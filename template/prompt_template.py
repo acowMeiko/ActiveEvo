@@ -1117,3 +1117,127 @@ JSON SCHEMA:
   }}
 }}'''
 
+
+# ==================== Stage 3 Post-draft Strict Transfer ====================
+
+POSTDRAFT_MEMORY_VERIFIER_PROMPT = r'''You are a strict applicability checker, not a problem solver.
+
+Read the current problem, its existing draft, and the candidate experience routing fields. Select at most one candidate only when the draft visibly contains one of that candidate's failure signals. Do not solve the problem, repair the draft, infer an unquoted error, or rewrite a candidate.
+
+Rules:
+1. All required evidence must be explicitly present in the current problem.
+2. Reject if the exclusion condition applies.
+3. matched_failure_signal must copy one complete failure signal exactly from the selected candidate.
+4. draft_error_quote must copy a non-empty contiguous passage exactly from the draft.
+5. The quoted draft passage must directly exhibit the copied failure signal.
+6. If no candidate satisfies every rule, selected_memory_id must be null.
+7. Return one JSON object only.
+
+Current problem:
+{question}
+
+Existing draft:
+{draft}
+
+Candidate routing fields:
+{candidates}
+
+Output schema:
+{{
+  "selected_memory_id": "candidate_xxx or null",
+  "problem_structure_match": true,
+  "all_required_evidence_present": true,
+  "exclusion_applies": false,
+  "matched_failure_signal": "exact copied candidate signal",
+  "draft_error_quote": "exact copied draft passage",
+  "action_applicable": true,
+  "reason": "brief evidence-based reason"
+}}'''
+
+
+POSTDRAFT_MEMORY_REVISION_PROMPT = r'''You are revising a mathematical draft using one narrowly targeted correction.
+
+Preserve every correct part of the existing draft. Modify only the quoted error and consequences that depend on it. Execute the supplied verification procedure and show its result; do not merely repeat the procedure. If the quoted passage does not actually exhibit the stated failure, retain the draft unchanged. Do not discuss retrieval, memory, IDs, scores, source problems, or audits. Do not box a final answer; a separate finalizer will do that.
+
+Use exactly this format:
+
+Draft Assessment:
+[identify whether the quoted error is real]
+
+Revised Method:
+[the minimal correction]
+
+Revised Reasoning:
+[the preserved draft with only necessary corrections]
+
+Verification:
+[execute the check]
+
+Current problem:
+{question}
+
+Existing draft:
+{draft}
+
+Quoted error location:
+{draft_error_quote}
+
+Matched failure signal:
+{matched_failure_signal}
+
+Corrective action:
+{action_guidance}
+
+Required verification:
+{verification_step}'''
+
+
+POSTDRAFT_GENERIC_LOCATOR_PROMPT = r'''You are a strict mathematical draft checker, not a solver.
+
+Inspect the current problem and draft for one concrete consequential error. Do not solve the problem or rewrite the draft. If an error exists, draft_error_quote must copy a non-empty contiguous passage exactly from the draft. If no concrete error can be located, set issue_found to false. Return one JSON object only.
+
+Current problem:
+{question}
+
+Existing draft:
+{draft}
+
+Output schema:
+{{
+  "issue_found": true,
+  "draft_error_quote": "exact copied draft passage",
+  "issue_description": "specific mathematical issue",
+  "reason": "brief evidence-based reason"
+}}'''
+
+
+POSTDRAFT_GENERIC_REVISION_PROMPT = r'''You are locally checking a mathematical draft without external experience.
+
+Preserve all correct steps. Inspect the quoted passage for the stated issue, repair only that issue and its consequences if it is real, and perform one direct verification. If no issue was found or the quote is not actually erroneous, retain the draft unchanged. Do not box a final answer; a separate finalizer will do that.
+
+Use exactly this format:
+
+Draft Assessment:
+[whether the issue is real]
+
+Revised Method:
+[minimal correction or retain the original method]
+
+Revised Reasoning:
+[corrected or retained reasoning]
+
+Verification:
+[one executed check]
+
+Current problem:
+{question}
+
+Existing draft:
+{draft}
+
+Potential error quote:
+{draft_error_quote}
+
+Potential issue:
+{issue_description}'''
+

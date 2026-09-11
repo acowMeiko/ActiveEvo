@@ -36,6 +36,15 @@ from modules.stage2.production_pipeline import (
     run_production_complete,
     validate_production_candidates,
 )
+from modules.stage2.recovery_pipeline import (
+    build_mixed_candidate_bank,
+    prepare_kimi_quality_sample,
+    prepare_qwen_recovery,
+    qwen_recovery_monitor,
+    qwen_recovery_status,
+    recover_qwen_generation,
+    run_kimi_quality_sample,
+)
 from modules.stage2.principle_test import (
     build_principle_test_report,
     generate_raw_candidates,
@@ -78,6 +87,13 @@ __all__ = [
     "audit_and_store_production",
     "run_production_complete",
     "production_status",
+    "prepare_qwen_recovery",
+    "recover_qwen_generation",
+    "qwen_recovery_monitor",
+    "qwen_recovery_status",
+    "build_mixed_candidate_bank",
+    "prepare_kimi_quality_sample",
+    "run_kimi_quality_sample",
     "prepare_principle_test",
     "run_provider_probe",
     "run_principle_test_smoke",

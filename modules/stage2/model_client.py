@@ -95,6 +95,7 @@ class Stage2ModelClient:
         *,
         thinking_enabled: bool | None = None,
         max_tokens: int | None = None,
+        accept_reasoning_only: bool = False,
     ) -> Dict[str, Any]:
         if self.generator_id == "qwen":
             # Qwen3.8 is a thinking model.  Never disable thinking merely to
@@ -131,9 +132,15 @@ class Stage2ModelClient:
         urls = await self._ordered_generator_urls()
         endpoint = urls[0]
         for endpoint_index, url in enumerate(urls):
-            token_budgets = [requested_tokens]
+            # vLLM reserves one terminal token when checking prompt + output
+            # against max_model_len.  A request that arithmetically equals the
+            # context limit can therefore fail as one token too long.  Keep a
+            # one-token safety margin without changing the configured protocol
+            # or invalidating existing generation checkpoints.
+            effective_tokens = max(1, requested_tokens - 1) if self.generator_id == "qwen" else requested_tokens
+            token_budgets = [effective_tokens]
             if self.generator_id == "qwen" and requested_tokens < self.config.qwen_generation_retry_max_tokens:
-                token_budgets.append(self.config.qwen_generation_retry_max_tokens)
+                token_budgets.append(max(1, self.config.qwen_generation_retry_max_tokens - 1))
             if (
                 self.generator_id == "kimi"
                 and use_thinking
@@ -225,6 +232,22 @@ class Stage2ModelClient:
                     ),
                 })
                 endpoint = url
+                if accept_reasoning_only and details["reasoning"]:
+                    # Diagnosis uses the reasoning trace itself as evidence;
+                    # it does not require a duplicate answer-channel render.
+                    # Accepting the first non-empty trace avoids repeating the
+                    # same long diagnosis across every local endpoint.
+                    return {
+                        "raw": content,
+                        "parsed": parse_json_object(content),
+                        "parse_source": "message.content",
+                        "endpoint": url,
+                        "generator_id": self.generator_id,
+                        "thinking_enabled": use_thinking,
+                        "reasoning_only_accepted": not bool(content),
+                        "attempts": attempts,
+                        **details,
+                    }
                 if content and not truncated:
                     return {
                         "raw": content,

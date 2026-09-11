@@ -185,8 +185,10 @@ serialization task, not a new analysis task.
 
 Do not solve the question. Do not re-read or reconstruct trajectories. Do not introduce
 a failure family, numerical example, answer, or mathematical claim that is absent from
-the frozen diagnosis. You may emit zero to {max_principles} families when the diagnosis
-says no reusable Principle is supported.
+the frozen diagnosis. Abstract away source-specific numbers, names, intermediate values,
+and final conclusions even when they appear in the diagnosis; express them as variables,
+roles, relations, or invariants. You may emit zero to {max_principles} families when the
+diagnosis says no reusable Principle is supported.
 
 Use only these rollout IDs when citing evidence: {json.dumps(rollout_ids, ensure_ascii=False)}
 
@@ -309,6 +311,7 @@ async def diagnose_principles(
     diagnosis_response = await client.generator(
         diagnosis_prompt,
         thinking_enabled=True,
+        accept_reasoning_only=(client.generator_id == "qwen"),
         max_tokens=(
             client.config.qwen_generation_analysis_max_tokens
             if client.generator_id == "qwen"

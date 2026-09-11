@@ -42,6 +42,7 @@ from modules.stage2.principle_test import (
     _load_bundles_by_level,
     _paired_counts,
     _stable_endpoint_index,
+    generation_input_hash,
     generate_raw_candidates,
 )
 from modules.stage2.protocol_calibration import (
@@ -79,6 +80,13 @@ DEFAULT_PROTOCOL_ROOTS = (
 )
 SEEDS = tuple(range(42, 52))
 TEMPERATURE = 0.7
+TERMINAL_GENERATION_STATUSES = {
+    "complete", "no_reliable_principle",
+}
+KIMI_INITIAL_AUDIT_LIMIT = 80
+KIMI_REAUDIT_LIMIT = 10
+KIMI_DIAGNOSTIC_LIMIT = 0
+KIMI_TOTAL_LIMIT = 90
 
 GENERIC_AFTER_DRAFT_PROMPT = r"""
 You are reviewing a complete mathematical draft without access to any stored
@@ -267,30 +275,128 @@ def prepare_production_target(
 
 
 async def generate_production_candidates(
-    config: Any, *, target_root: Path, concurrency: int,
+    config: Any,
+    *,
+    target_root: Path,
+    concurrency: int,
+    reuse_roots: Sequence[Path] = (),
 ) -> dict[str, Any]:
-    summary = await generate_raw_candidates(
-        config, test_root=Path(target_root), concurrency=concurrency,
-    )
+    root = Path(target_root)
     bundles = {
         str(row["question_id"]): row
-        for row in load_json(Path(target_root) / "source_bundles" / "source40_bundles.json")
+        for row in load_json(root / "source_bundles" / "source40_bundles.json")
     }
-    bank = load_json(Path(target_root) / "raw_candidates" / "candidate_bank.json")
+    result_dir = root / "raw_candidates" / "questions"
+    reuse_summary = _reuse_generation_records(
+        config,
+        bundles=bundles,
+        result_dir=result_dir,
+        reuse_roots=reuse_roots,
+    )
+    summary = await generate_raw_candidates(
+        config, test_root=root, concurrency=concurrency,
+    )
+    bank = load_json(root / "raw_candidates" / "candidate_bank.json")
+    candidate_ids = [str(row["candidate_id"]) for row in bank.get("candidates", [])]
+    if len(candidate_ids) != len(set(candidate_ids)):
+        raise RuntimeError("Candidate Bank contains duplicate candidate IDs")
     valid = 0
     invalid = 0
     for candidate in bank.get("candidates", []):
         check = _format_check(candidate, bundles[str(candidate["question_id"])])
         atomic_save_json(
-            Path(target_root) / "format_checks" / f"{candidate['candidate_id']}.json", check,
+            root / "format_checks" / f"{candidate['candidate_id']}.json", check,
         )
         if check["hard_invalid"]:
             invalid += 1
         else:
             valid += 1
-    result = {**summary, "format_valid": valid, "format_invalid": invalid}
-    atomic_save_json(Path(target_root) / "generation_summary.json", result)
+    result = {
+        **summary,
+        **reuse_summary,
+        "deepseek_question_generation_count": reuse_summary["pending_generation_count"],
+        "kimi_call_count": 0,
+        "format_valid": valid,
+        "format_invalid": invalid,
+    }
+    logger.info(
+        "[Stage2 Principle生成] 结束：目标=%d，跨批次复用=%d，目标目录原有=%d，"
+        "本次需DeepSeek生成=%d，Kimi调用=0，格式合法=%d，格式失败=%d",
+        len(bundles), result["reused_question_count"],
+        result["preexisting_question_count"], result["pending_generation_count"],
+        valid, invalid,
+    )
+    atomic_save_json(root / "generation_summary.json", result)
     return result
+
+
+def _compatible_generation_record(
+    path: Path,
+    *,
+    expected_generation_input_hash: str,
+) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        record = load_json(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(record, dict):
+        return None
+    if record.get("status") not in TERMINAL_GENERATION_STATUSES:
+        return None
+    if record.get("generation_input_hash") != expected_generation_input_hash:
+        return None
+    return record
+
+
+def _reuse_generation_records(
+    config: Any,
+    *,
+    bundles: Mapping[str, Mapping[str, Any]],
+    result_dir: Path,
+    reuse_roots: Sequence[Path],
+) -> dict[str, int]:
+    """Materialize hash-compatible question records into a larger target batch."""
+    reused = 0
+    preexisting = 0
+    incompatible_target = 0
+    pending = 0
+    for qid, bundle in bundles.items():
+        expected_hash = generation_input_hash(config, bundle)
+        target_path = result_dir / f"{qid}.json"
+        if target_path.exists():
+            if _compatible_generation_record(
+                target_path, expected_generation_input_hash=expected_hash,
+            ) is not None:
+                preexisting += 1
+            else:
+                incompatible_target += 1
+                pending += 1
+            continue
+        reused_record = None
+        for reuse_root in reuse_roots:
+            source_path = Path(reuse_root) / "raw_candidates" / "questions" / f"{qid}.json"
+            reused_record = _compatible_generation_record(
+                source_path, expected_generation_input_hash=expected_hash,
+            )
+            if reused_record is not None:
+                atomic_save_json(target_path, reused_record)
+                reused += 1
+                break
+        if reused_record is None:
+            pending += 1
+    logger.info(
+        "[Stage2 Principle生成] 续跑预检：目标=%d，跨批次复用=%d，"
+        "目标目录原有=%d，目标目录不兼容=%d，待生成=%d",
+        len(bundles), reused, preexisting, incompatible_target, pending,
+    )
+    return {
+        "reused_question_count": reused,
+        "preexisting_question_count": preexisting,
+        "incompatible_target_question_count": incompatible_target,
+        "pending_generation_count": pending,
+    }
 
 
 def production_status(production_root: Path, target_size: int) -> dict[str, Any]:
@@ -725,11 +831,31 @@ async def _kimi_audit_once(
             "format_check": format_check, "response": response,
             "audit": audit, "protocol_errors": errors,
         }
+    resolved_decision, consistency_errors = _resolve_kimi_audit_decision(audit)
+    if consistency_errors:
+        return {
+            "status": "audit_inconsistent", "decision": "audit_inconsistent",
+            "format_check": format_check, "response": response,
+            "audit": audit, "protocol_errors": consistency_errors,
+        }
     return {
-        "status": "complete", "decision": _decision(audit),
+        "status": "complete", "decision": resolved_decision,
         "format_check": format_check, "response": response, "audit": audit,
         "protocol_errors": [],
     }
+
+
+def _resolve_kimi_audit_decision(
+    audit: Mapping[str, Any],
+) -> tuple[str, list[str]]:
+    derived_decision = _decision(audit)
+    reported_decision = str(audit.get("decision", "")).strip().lower()
+    if reported_decision == derived_decision:
+        return derived_decision, []
+    return "audit_inconsistent", [
+        "decision_dimension_inconsistent:"
+        f"reported={reported_decision}:derived={derived_decision}"
+    ]
 
 
 async def _deepseek_failure_analyses(
@@ -798,6 +924,84 @@ def _write_jsonl(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     temporary.replace(path)
 
 
+def _select_kimi_initial_candidates(
+    candidates: Mapping[str, Mapping[str, Any]],
+    effects: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+) -> list[dict[str, Any]]:
+    """Choose at most one strongest source-helpful candidate per question.
+
+    The sample first allocates an equal quota to each Stage-1 level. Any level
+    shortfall is filled by the strongest remaining candidates, with a stable
+    candidate hash as the final tie-breaker.
+    """
+    if limit <= 0:
+        return []
+
+    def priority(effect: Mapping[str, Any]) -> tuple[Any, ...]:
+        paired = effect.get("paired_vs_generic") or {}
+        gain = int(paired.get("gain", 0))
+        loss = int(paired.get("loss", 0))
+        return (
+            -int(effect.get("delta_vs_generic", 0)),
+            loss,
+            -gain,
+            hashlib.sha256(str(effect.get("candidate_id", "")).encode()).hexdigest(),
+        )
+
+    best_by_question: dict[str, Mapping[str, Any]] = {}
+    for effect in effects:
+        if effect.get("effect_label") != "source_helpful":
+            continue
+        cid = str(effect.get("candidate_id", ""))
+        if cid not in candidates:
+            continue
+        qid = str(effect.get("question_id", ""))
+        previous = best_by_question.get(qid)
+        if previous is None or priority(effect) < priority(previous):
+            best_by_question[qid] = effect
+
+    levels = ("level1", "level2", "level3", "level4")
+    grouped: dict[str, list[Mapping[str, Any]]] = {level: [] for level in levels}
+    overflow: list[Mapping[str, Any]] = []
+    for effect in best_by_question.values():
+        candidate = candidates[str(effect["candidate_id"])]
+        level = str(candidate.get("level", ""))
+        if level in grouped:
+            grouped[level].append(effect)
+        else:
+            overflow.append(effect)
+    for rows in grouped.values():
+        rows.sort(key=priority)
+
+    base, remainder = divmod(limit, len(levels))
+    selected_effects: list[Mapping[str, Any]] = []
+    selected_ids: set[str] = set()
+    for index, level in enumerate(levels):
+        quota = base + (1 if index < remainder else 0)
+        for effect in grouped[level][:quota]:
+            selected_effects.append(effect)
+            selected_ids.add(str(effect["candidate_id"]))
+
+    remaining = overflow + [
+        effect
+        for level in levels
+        for effect in grouped[level]
+        if str(effect["candidate_id"]) not in selected_ids
+    ]
+    remaining.sort(key=priority)
+    for effect in remaining:
+        if len(selected_effects) >= limit:
+            break
+        cid = str(effect["candidate_id"])
+        if cid not in selected_ids:
+            selected_effects.append(effect)
+            selected_ids.add(cid)
+
+    return [dict(candidates[str(effect["candidate_id"])]) for effect in selected_effects]
+
+
 async def audit_and_store_production(
     config: Any,
     *,
@@ -807,8 +1011,10 @@ async def audit_and_store_production(
     validation_concurrency: int,
     audit_concurrency: int,
     timeout: int,
-    kimi_max_calls: int = 300,
-    diagnostic_sample_size: int = 30,
+    kimi_max_calls: int = KIMI_TOTAL_LIMIT,
+    initial_audit_limit: int = KIMI_INITIAL_AUDIT_LIMIT,
+    reaudit_limit: int = KIMI_REAUDIT_LIMIT,
+    diagnostic_sample_size: int = KIMI_DIAGNOSTIC_LIMIT,
 ) -> dict[str, Any]:
     root = Path(target_root)
     bundles = {
@@ -819,19 +1025,28 @@ async def audit_and_store_production(
     candidates = {str(row["candidate_id"]): row for row in bank.get("candidates", [])}
     raw_effects = load_json(root / "local_validation" / "candidate_effects_raw.json")
     effects_by_id = {str(row["candidate_id"]): row for row in raw_effects}
-    helpful = sorted(
-        (candidates[str(row["candidate_id"])] for row in raw_effects
-         if row.get("effect_label") == "source_helpful"),
-        key=lambda row: hashlib.sha256(str(row["candidate_id"]).encode()).hexdigest(),
+    helpful = [
+        candidates[str(row["candidate_id"])] for row in raw_effects
+        if row.get("effect_label") == "source_helpful"
+        and str(row.get("candidate_id")) in candidates
+    ]
+    requested_total = (
+        max(0, int(initial_audit_limit))
+        + max(0, int(reaudit_limit))
+        + max(0, int(diagnostic_sample_size))
     )
-    diagnostic_budget = min(max(0, int(diagnostic_sample_size)), int(kimi_max_calls))
-    positive_budget = max(0, int(kimi_max_calls) - diagnostic_budget)
-    # Keep a small reserve for reaudit. Existing evidence suggests repairs are
-    # uncommon; 30 slots prevent an initial wave from consuming the whole gate.
-    reaudit_reserve = min(30, max(0, positive_budget // 5))
-    initial_limit = min(len(helpful), max(0, positive_budget - reaudit_reserve))
-    initial_candidates = helpful[:initial_limit]
-    awaiting = helpful[initial_limit:]
+    if requested_total > int(kimi_max_calls):
+        raise ValueError(
+            "Kimi sub-budgets exceed the hard total limit: "
+            f"initial={initial_audit_limit}, reaudit={reaudit_limit}, "
+            f"diagnostic={diagnostic_sample_size}, total={kimi_max_calls}"
+        )
+    initial_candidates = _select_kimi_initial_candidates(
+        candidates, raw_effects, limit=max(0, int(initial_audit_limit)),
+    )
+    initial_ids = {str(row["candidate_id"]) for row in initial_candidates}
+    awaiting = [row for row in helpful if str(row["candidate_id"]) not in initial_ids]
+    diagnostic_budget = max(0, int(diagnostic_sample_size))
     client = Stage2ModelClient(config, generator_id="deepseek")
     semaphore = asyncio.Semaphore(max(1, audit_concurrency))
 
@@ -910,13 +1125,11 @@ async def audit_and_store_production(
             for row in load_json(root / "local_validation" / "candidate_effects_repaired.json")
         }
 
-    initial_call_count = len(initial_records)
-    remaining_positive_budget = max(0, positive_budget - initial_call_count)
     reaudit_candidates = [
         candidate for candidate in repair_candidates
         if repaired_effects.get(str(candidate["candidate_id"]), {}).get("effect_label")
         == "source_helpful"
-    ][:remaining_positive_budget]
+    ][:max(0, int(reaudit_limit))]
 
     async def reaudit(candidate: Mapping[str, Any]) -> dict[str, Any]:
         cid = str(candidate["candidate_id"])
@@ -996,16 +1209,18 @@ async def audit_and_store_production(
         status = str(raw_effect.get("effect_label", "protocol_failed"))
         audit_record = audit_by_id.get(cid)
         if cid in awaiting_ids:
-            status = "awaiting_audit"
+            status = "source_helpful_unreviewed"
         elif raw_effect.get("effect_label") == "source_helpful":
             if not audit_record:
-                status = "awaiting_audit"
+                status = "source_helpful_unreviewed"
             elif audit_record.get("decision") == "pass":
                 status = "pending_transfer_validation"
             elif audit_record.get("decision") == "reject":
                 status = "content_rejected"
             elif audit_record.get("decision") == "protocol_failed":
                 status = "protocol_failed"
+            elif audit_record.get("decision") == "audit_inconsistent":
+                status = "audit_inconsistent"
             elif audit_record.get("decision") == "repair":
                 repaired = repaired_by_id.get(cid)
                 repaired_effect = repaired_effects.get(cid, {})
@@ -1016,11 +1231,13 @@ async def audit_and_store_production(
                 if repaired_effect.get("effect_label") != "source_helpful":
                     status = str(repaired_effect.get("effect_label", "protocol_failed"))
                 elif not final_audit:
-                    status = "awaiting_audit"
+                    status = "source_helpful_unreviewed"
                 elif final_audit.get("decision") == "pass":
                     status = "pending_transfer_validation"
                 elif final_audit.get("decision") == "protocol_failed":
                     status = "protocol_failed"
+                elif final_audit.get("decision") == "audit_inconsistent":
+                    status = "audit_inconsistent"
                 else:
                     status = "content_rejected"
         content_hash = _json_hash(content)
@@ -1069,10 +1286,19 @@ async def audit_and_store_production(
         "raw_candidate_count": len(candidates),
         "raw_effect_counts": dict(Counter(row.get("effect_label") for row in raw_effects)),
         "initial_helpful_count": len(helpful),
+        "selected_helpful_question_count": len(initial_candidates),
+        "selected_helpful_level_counts": dict(Counter(
+            str(row.get("level", "unknown")) for row in initial_candidates
+        )),
+        "source_helpful_unreviewed_count": len(
+            not_validated.get("source_helpful_unreviewed", [])
+        ),
         "initial_kimi_audit_count": len(initial_records),
+        "kimi_initial_audit_limit": int(initial_audit_limit),
         "repair_count": len(repair_records),
         "repaired_validation_count": len(repair_candidates),
         "kimi_reaudit_count": len(reaudit_records),
+        "kimi_reaudit_limit": int(reaudit_limit),
         "diagnostic_kimi_count": len(diagnostic_records),
         "diagnostic_kimi_budget": diagnostic_budget,
         "kimi_call_count": kimi_calls,
@@ -1121,6 +1347,9 @@ async def run_production_complete(
     audit_concurrency: int,
     timeout: int,
     kimi_max_calls: int,
+    kimi_initial_audit_limit: int = KIMI_INITIAL_AUDIT_LIMIT,
+    kimi_reaudit_limit: int = KIMI_REAUDIT_LIMIT,
+    kimi_diagnostic_limit: int = KIMI_DIAGNOSTIC_LIMIT,
 ) -> dict[str, Any]:
     prepared = prepare_production_target(
         config, production_root=production_root,
@@ -1162,7 +1391,10 @@ async def run_production_complete(
         config, target_root=smoke_root, ports=ports, model=model,
         validation_concurrency=min(2, validation_concurrency),
         audit_concurrency=min(2, audit_concurrency), timeout=timeout,
-        kimi_max_calls=min(30, kimi_max_calls), diagnostic_sample_size=0,
+        kimi_max_calls=min(4, kimi_max_calls),
+        initial_audit_limit=min(2, kimi_initial_audit_limit),
+        reaudit_limit=min(2, kimi_reaudit_limit),
+        diagnostic_sample_size=0,
     )
     smoke = {
         "generation": smoke_generation,
@@ -1173,6 +1405,7 @@ async def run_production_complete(
     logger.info("[Stage2生产预检] 2题Smoke完成；开始正式%s题批次", target_size)
     generation = await generate_production_candidates(
         config, target_root=target_root, concurrency=generation_concurrency,
+        reuse_roots=(Path(production_root) / "batch_0300",) if target_size == 1200 else (),
     )
     validation = await validate_production_candidates(
         config, target_root=target_root, ports=ports, model=model,
@@ -1183,6 +1416,9 @@ async def run_production_complete(
         validation_concurrency=validation_concurrency,
         audit_concurrency=audit_concurrency, timeout=timeout,
         kimi_max_calls=kimi_max_calls,
+        initial_audit_limit=kimi_initial_audit_limit,
+        reaudit_limit=kimi_reaudit_limit,
+        diagnostic_sample_size=kimi_diagnostic_limit,
     )
     result = {
         "prepare": prepared,

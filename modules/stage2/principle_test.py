@@ -837,6 +837,30 @@ def require_variant_approvals(test_root: Path) -> dict[str, Any]:
     return {"approved_count": 40, "approved_question_ids": sorted(approved)}
 
 
+def _response_has_transport_failure(response: Mapping[str, Any]) -> bool:
+    if str(response.get("content", "")).strip() or str(response.get("reasoning", "")).strip():
+        return False
+    for attempt in response.get("attempts", []) or []:
+        if not isinstance(attempt, Mapping):
+            continue
+        for transport in attempt.get("transport_attempts", []) or []:
+            if isinstance(transport, Mapping) and transport.get("error"):
+                return True
+    return False
+
+
+def _generation_record_reusable(record: Mapping[str, Any], expected_hash: str) -> bool:
+    if record.get("generation_input_hash") != expected_hash:
+        return False
+    status = record.get("status")
+    if status in {"complete", "no_reliable_principle"}:
+        return True
+    if status != "terminal_failed":
+        return False
+    diagnosis_response = (record.get("diagnosis") or {}).get("response") or {}
+    return not _response_has_transport_failure(diagnosis_response)
+
+
 async def generate_raw_candidates(
     config: Any,
     *,
@@ -862,10 +886,7 @@ async def generate_raw_candidates(
         )
         if registry_path is not None and registry_path.exists():
             saved = load_json(registry_path)
-            if (
-                saved.get("status") in {"complete", "no_reliable_principle", "terminal_failed"}
-                and saved.get("generation_input_hash") == expected_generation_input_hash
-            ):
+            if _generation_record_reusable(saved, expected_generation_input_hash):
                 atomic_save_json(path, saved)
                 logger.info(
                     "[Principle生成] 题目=%s，复用已有结果，状态=%s", qid, saved.get("status")
@@ -873,10 +894,7 @@ async def generate_raw_candidates(
                 return saved
         if path.exists():
             saved = load_json(path)
-            if (
-                saved.get("status") in {"complete", "no_reliable_principle", "terminal_failed"}
-                and saved.get("generation_input_hash") == expected_generation_input_hash
-            ):
+            if _generation_record_reusable(saved, expected_generation_input_hash):
                 if registry_path is not None:
                     atomic_save_json(registry_path, saved)
                 logger.info(
@@ -895,8 +913,14 @@ async def generate_raw_candidates(
                     client, bundle, config.stage2.max_principles_per_question
                 )
             if not diagnosis.get("success"):
+                infrastructure_failed = _response_has_transport_failure(
+                    diagnosis.get("response") or {}
+                )
                 record = {
-                    "status": "terminal_failed", "question_id": qid,
+                    "status": (
+                        "infrastructure_failed" if infrastructure_failed else "terminal_failed"
+                    ),
+                    "question_id": qid,
                     "level": bundle["level"], "diagnosis": diagnosis,
                     "generation_input_hash": expected_generation_input_hash,
                 }
@@ -934,7 +958,14 @@ async def generate_raw_candidates(
                         diagnosis["diagnosis_text"], correction_feedback=feedback,
                     )
             families = synthesis.get("families", [])
-            status = "complete" if families else "no_reliable_principle"
+            synthesis_transport_failed = _response_has_transport_failure(
+                synthesis.get("synthesis_stage") or {}
+            )
+            status = (
+                "infrastructure_failed"
+                if synthesis_transport_failed
+                else ("complete" if families else "no_reliable_principle")
+            )
             record = {
                 "status": status, "question_id": qid, "level": bundle["level"],
                 "bundle_hash": _json_hash(bundle), "diagnosis": diagnosis,

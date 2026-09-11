@@ -155,8 +155,31 @@ def test_qwen_length_retry_never_disables_thinking(monkeypatch) -> None:
     result = asyncio.run(Stage2ModelClient(_config(), generator_id="qwen").generator("probe"))
 
     assert result["parsed"] == {"ok": True}
-    assert [item["max_tokens"] for item in calls] == [4096, 8192]
+    assert [item["max_tokens"] for item in calls] == [4095, 8191]
     assert all(item["chat_template_kwargs"]["enable_thinking"] is True for item in calls)
+
+
+def test_qwen_diagnosis_accepts_first_nonempty_reasoning_trace(monkeypatch) -> None:
+    calls = []
+
+    async def fake_call(**kwargs):
+        calls.append(kwargs)
+        return {"raw": {"choices": [{
+            "finish_reason": "length",
+            "message": {"reasoning_content": "usable diagnosis", "content": ""},
+        }]}}
+
+    monkeypatch.setattr(model_client_module, "async_llm_call_with_metadata", fake_call)
+    result = asyncio.run(
+        Stage2ModelClient(_config(), generator_id="qwen").generator(
+            "diagnose", max_tokens=6144, accept_reasoning_only=True,
+        )
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["max_tokens"] == 6143
+    assert result["reasoning"] == "usable diagnosis"
+    assert result["reasoning_only_accepted"] is True
 
 
 def test_kimi_critic_and_formatter_use_separate_fixed_protocols(monkeypatch) -> None:
