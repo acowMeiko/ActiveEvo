@@ -125,7 +125,6 @@ Exclude the 40 protocol-development questions
         v
 Freeze production1200 + reserve18
 First batch300 quotas by original correct@10:
-96 / 52 / 45 / 32 / 26 / 24 / 25
         |
         v
 DeepSeek diagnosis (Thinking, 8192 tokens)
@@ -150,7 +149,7 @@ No heuristic mathematical rejection
         |
         v
 Reuse frozen Stage-1 baseline drafts
-Solver-v1.1, temperature=0.7, seeds=42..51
+Solver-v1.1, temperature=0.7, 
         |
         +---------------- Generic control ----------------+
         |                                                  |
